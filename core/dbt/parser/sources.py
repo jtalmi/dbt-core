@@ -364,7 +364,7 @@ def merge_freshness(
         merged_freshness.error_after = merged_error_after
         merged_freshness.warn_after = merged_warn_after
         return merged_freshness
-    elif base is None and update is not None:
+    elif base is None and not update:
         return update
     else:
         return None
