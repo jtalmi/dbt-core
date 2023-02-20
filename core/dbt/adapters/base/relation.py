@@ -1,22 +1,28 @@
 from collections.abc import Hashable
-from dataclasses import dataclass
-from typing import (
-    Optional, TypeVar, Any, Type, Dict, Union, Iterator, Tuple, Set
-)
+from dataclasses import dataclass, field
+from typing import Optional, TypeVar, Any, Type, Dict, Iterator, Tuple, Set
 
-from dbt.contracts.graph.compiled import CompiledNode
-from dbt.contracts.graph.parsed import ParsedSourceDefinition, ParsedNode
+from dbt.contracts.graph.nodes import SourceDefinition, ManifestNode, ResultNode, ParsedNode
 from dbt.contracts.relation import (
-    RelationType, ComponentName, HasQuoting, FakeAPIObject, Policy, Path
+    RelationType,
+    ComponentName,
+    HasQuoting,
+    FakeAPIObject,
+    Policy,
+    Path,
 )
-from dbt.exceptions import InternalException
+from dbt.exceptions import (
+    ApproximateMatchError,
+    DbtInternalError,
+    MultipleDatabasesNotAllowedError,
+)
 from dbt.node_types import NodeType
 from dbt.utils import filter_null_values, deep_merge, classproperty
 
 import dbt.exceptions
 
 
-Self = TypeVar('Self', bound='BaseRelation')
+Self = TypeVar("Self", bound="BaseRelation")
 
 
 @dataclass(frozen=True, eq=False, repr=False)
@@ -24,8 +30,10 @@ class BaseRelation(FakeAPIObject, Hashable):
     path: Path
     type: Optional[RelationType] = None
     quote_character: str = '"'
-    include_policy: Policy = Policy()
-    quote_policy: Policy = Policy()
+    # Python 3.11 requires that these use default_factory instead of simple default
+    # ValueError: mutable default <class 'dbt.contracts.relation.Policy'> for field include_policy is not allowed: use default_factory
+    include_policy: Policy = field(default_factory=lambda: Policy())
+    quote_policy: Policy = field(default_factory=lambda: Policy())
     dbt_created: bool = False
 
     def _is_exactish_match(self, field: ComponentName, value: str) -> bool:
@@ -36,11 +44,11 @@ class BaseRelation(FakeAPIObject, Hashable):
 
     @classmethod
     def _get_field_named(cls, field_name):
-        for field, _ in cls._get_fields():
-            if field.name == field_name:
-                return field
+        for f, _ in cls._get_fields():
+            if f.name == field_name:
+                return f
         # this should be unreachable
-        raise ValueError(f'BaseRelation has no {field_name} field!')
+        raise ValueError(f"BaseRelation has no {field_name} field!")
 
     def __eq__(self, other):
         if not isinstance(other, self.__class__):
@@ -49,20 +57,18 @@ class BaseRelation(FakeAPIObject, Hashable):
 
     @classmethod
     def get_default_quote_policy(cls) -> Policy:
-        return cls._get_field_named('quote_policy').default
+        return cls._get_field_named("quote_policy").default_factory()
 
     @classmethod
     def get_default_include_policy(cls) -> Policy:
-        return cls._get_field_named('include_policy').default
+        return cls._get_field_named("include_policy").default_factory()
 
     def get(self, key, default=None):
         """Override `.get` to return a metadata object so we don't break
         dbt_utils.
         """
-        if key == 'metadata':
-            return {
-                'type': self.__class__.__name__
-            }
+        if key == "metadata":
+            return {"type": self.__class__.__name__}
         return super().get(key, default)
 
     def matches(
@@ -71,16 +77,19 @@ class BaseRelation(FakeAPIObject, Hashable):
         schema: Optional[str] = None,
         identifier: Optional[str] = None,
     ) -> bool:
-        search = filter_null_values({
-            ComponentName.Database: database,
-            ComponentName.Schema: schema,
-            ComponentName.Identifier: identifier
-        })
+        search = filter_null_values(
+            {
+                ComponentName.Database: database,
+                ComponentName.Schema: schema,
+                ComponentName.Identifier: identifier,
+            }
+        )
 
         if not search:
             # nothing was passed in
-            raise dbt.exceptions.RuntimeException(
-                "Tried to match relation, but no search path was passed!")
+            raise dbt.exceptions.DbtRuntimeError(
+                "Tried to match relation, but no search path was passed!"
+            )
 
         exact_match = True
         approximate_match = True
@@ -88,15 +97,14 @@ class BaseRelation(FakeAPIObject, Hashable):
         for k, v in search.items():
             if not self._is_exactish_match(k, v):
                 exact_match = False
-
-            if self.path.get_lowered_part(k) != v.lower():
-                approximate_match = False
+            if str(self.path.get_lowered_part(k)).strip(self.quote_character) != v.lower().strip(
+                self.quote_character
+            ):
+                approximate_match = False  # type: ignore[union-attr]
 
         if approximate_match and not exact_match:
-            target = self.create(
-                database=database, schema=schema, identifier=identifier
-            )
-            dbt.exceptions.approximate_relation_match(target, self)
+            target = self.create(database=database, schema=schema, identifier=identifier)
+            raise ApproximateMatchError(target, self)
 
         return exact_match
 
@@ -109,11 +117,13 @@ class BaseRelation(FakeAPIObject, Hashable):
         schema: Optional[bool] = None,
         identifier: Optional[bool] = None,
     ) -> Self:
-        policy = filter_null_values({
-            ComponentName.Database: database,
-            ComponentName.Schema: schema,
-            ComponentName.Identifier: identifier
-        })
+        policy = filter_null_values(
+            {
+                ComponentName.Database: database,
+                ComponentName.Schema: schema,
+                ComponentName.Identifier: identifier,
+            }
+        )
 
         new_quote_policy = self.quote_policy.replace_dict(policy)
         return self.replace(quote_policy=new_quote_policy)
@@ -124,16 +134,18 @@ class BaseRelation(FakeAPIObject, Hashable):
         schema: Optional[bool] = None,
         identifier: Optional[bool] = None,
     ) -> Self:
-        policy = filter_null_values({
-            ComponentName.Database: database,
-            ComponentName.Schema: schema,
-            ComponentName.Identifier: identifier
-        })
+        policy = filter_null_values(
+            {
+                ComponentName.Database: database,
+                ComponentName.Schema: schema,
+                ComponentName.Identifier: identifier,
+            }
+        )
 
         new_include_policy = self.include_policy.replace_dict(policy)
         return self.replace(include_policy=new_include_policy)
 
-    def information_schema(self, view_name=None) -> 'InformationSchema':
+    def information_schema(self, view_name=None) -> "InformationSchema":
         # some of our data comes from jinja, where things can be `Undefined`.
         if not isinstance(view_name, str):
             view_name = None
@@ -143,10 +155,10 @@ class BaseRelation(FakeAPIObject, Hashable):
         info_schema = InformationSchema.from_relation(self, view_name)
         return info_schema.incorporate(path={"schema": None})
 
-    def information_schema_only(self) -> 'InformationSchema':
+    def information_schema_only(self) -> "InformationSchema":
         return self.information_schema()
 
-    def without_identifier(self) -> 'BaseRelation':
+    def without_identifier(self) -> "BaseRelation":
         """Return a form of this relation that only has the database and schema
         set to included. To get the appropriately-quoted form the schema out of
         the result (for use as part of a query), use `.render()`. To get the
@@ -156,9 +168,7 @@ class BaseRelation(FakeAPIObject, Hashable):
         """
         return self.include(identifier=False).replace_path(identifier=None)
 
-    def _render_iterator(
-        self
-    ) -> Iterator[Tuple[Optional[ComponentName], Optional[str]]]:
+    def _render_iterator(self) -> Iterator[Tuple[Optional[ComponentName], Optional[str]]]:
 
         for key in ComponentName:
             path_part: Optional[str] = None
@@ -170,27 +180,22 @@ class BaseRelation(FakeAPIObject, Hashable):
 
     def render(self) -> str:
         # if there is nothing set, this will return the empty string.
-        return '.'.join(
-            part for _, part in self._render_iterator()
-            if part is not None
-        )
+        return ".".join(part for _, part in self._render_iterator() if part is not None)
 
     def quoted(self, identifier):
-        return '{quote_char}{identifier}{quote_char}'.format(
+        return "{quote_char}{identifier}{quote_char}".format(
             quote_char=self.quote_character,
             identifier=identifier,
         )
 
     @classmethod
-    def create_from_source(
-        cls: Type[Self], source: ParsedSourceDefinition, **kwargs: Any
-    ) -> Self:
+    def create_from_source(cls: Type[Self], source: SourceDefinition, **kwargs: Any) -> Self:
         source_quoting = source.quoting.to_dict(omit_none=True)
-        source_quoting.pop('column', None)
+        source_quoting.pop("column", None)
         quote_policy = deep_merge(
             cls.get_default_quote_policy().to_dict(omit_none=True),
             source_quoting,
-            kwargs.get('quote_policy', {}),
+            kwargs.get("quote_policy", {}),
         )
 
         return cls.create(
@@ -198,18 +203,18 @@ class BaseRelation(FakeAPIObject, Hashable):
             schema=source.schema,
             identifier=source.identifier,
             quote_policy=quote_policy,
-            **kwargs
+            **kwargs,
         )
 
     @staticmethod
     def add_ephemeral_prefix(name: str):
-        return f'__dbt__cte__{name}'
+        return f"__dbt__cte__{name}"
 
     @classmethod
     def create_ephemeral_from_node(
         cls: Type[Self],
         config: HasQuoting,
-        node: Union[ParsedNode, CompiledNode],
+        node: ManifestNode,
     ) -> Self:
         # Note that ephemeral models are based on the name.
         identifier = cls.add_ephemeral_prefix(node.name)
@@ -222,7 +227,7 @@ class BaseRelation(FakeAPIObject, Hashable):
     def create_from_node(
         cls: Type[Self],
         config: HasQuoting,
-        node: Union[ParsedNode, CompiledNode],
+        node: ManifestNode,
         quote_policy: Optional[Dict[str, bool]] = None,
         **kwargs: Any,
     ) -> Self:
@@ -236,27 +241,27 @@ class BaseRelation(FakeAPIObject, Hashable):
             schema=node.schema,
             identifier=node.alias,
             quote_policy=quote_policy,
-            **kwargs)
+            **kwargs,
+        )
 
     @classmethod
     def create_from(
         cls: Type[Self],
         config: HasQuoting,
-        node: Union[CompiledNode, ParsedNode, ParsedSourceDefinition],
+        node: ResultNode,
         **kwargs: Any,
     ) -> Self:
         if node.resource_type == NodeType.Source:
-            if not isinstance(node, ParsedSourceDefinition):
-                raise InternalException(
-                    'type mismatch, expected ParsedSourceDefinition but got {}'
-                    .format(type(node))
+            if not isinstance(node, SourceDefinition):
+                raise DbtInternalError(
+                    "type mismatch, expected SourceDefinition but got {}".format(type(node))
                 )
             return cls.create_from_source(node, **kwargs)
         else:
-            if not isinstance(node, (ParsedNode, CompiledNode)):
-                raise InternalException(
-                    'type mismatch, expected ParsedNode or CompiledNode but '
-                    'got {}'.format(type(node))
+            # Can't use ManifestNode here because of parameterized generics
+            if not isinstance(node, (ParsedNode)):
+                raise DbtInternalError(
+                    f"type mismatch, expected ManifestNode but got {type(node)}"
                 )
             return cls.create_from_node(config, node, **kwargs)
 
@@ -269,14 +274,16 @@ class BaseRelation(FakeAPIObject, Hashable):
         type: Optional[RelationType] = None,
         **kwargs,
     ) -> Self:
-        kwargs.update({
-            'path': {
-                'database': database,
-                'schema': schema,
-                'identifier': identifier,
-            },
-            'type': type,
-        })
+        kwargs.update(
+            {
+                "path": {
+                    "database": database,
+                    "schema": schema,
+                    "identifier": identifier,
+                },
+                "type": type,
+            }
+        )
         return cls.from_dict(kwargs)
 
     def __repr__(self) -> str:
@@ -342,7 +349,7 @@ class BaseRelation(FakeAPIObject, Hashable):
         return RelationType
 
 
-Info = TypeVar('Info', bound='InformationSchema')
+Info = TypeVar("Info", bound="InformationSchema")
 
 
 @dataclass(frozen=True, eq=False, repr=False)
@@ -351,18 +358,16 @@ class InformationSchema(BaseRelation):
 
     def __post_init__(self):
         if not isinstance(self.information_schema_view, (type(None), str)):
-            raise dbt.exceptions.CompilationException(
-                'Got an invalid name: {}'.format(self.information_schema_view)
+            raise dbt.exceptions.CompilationError(
+                "Got an invalid name: {}".format(self.information_schema_view)
             )
 
     @classmethod
-    def get_path(
-        cls, relation: BaseRelation, information_schema_view: Optional[str]
-    ) -> Path:
+    def get_path(cls, relation: BaseRelation, information_schema_view: Optional[str]) -> Path:
         return Path(
             database=relation.database,
             schema=relation.schema,
-            identifier='INFORMATION_SCHEMA',
+            identifier="INFORMATION_SCHEMA",
         )
 
     @classmethod
@@ -393,9 +398,7 @@ class InformationSchema(BaseRelation):
         relation: BaseRelation,
         information_schema_view: Optional[str],
     ) -> Info:
-        include_policy = cls.get_include_policy(
-            relation, information_schema_view
-        )
+        include_policy = cls.get_include_policy(relation, information_schema_view)
         quote_policy = cls.get_quote_policy(relation, information_schema_view)
         path = cls.get_path(relation, information_schema_view)
         return cls(
@@ -417,6 +420,7 @@ class SchemaSearchMap(Dict[InformationSchema, Set[Optional[str]]]):
     search for what schemas. The schema values are all lowercased to avoid
     duplication.
     """
+
     def add(self, relation: BaseRelation):
         key = relation.information_schema_only()
         if key not in self:
@@ -426,9 +430,7 @@ class SchemaSearchMap(Dict[InformationSchema, Set[Optional[str]]]):
             schema = relation.schema.lower()
         self[key].add(schema)
 
-    def search(
-        self
-    ) -> Iterator[Tuple[InformationSchema, Optional[str]]]:
+    def search(self) -> Iterator[Tuple[InformationSchema, Optional[str]]]:
         for information_schema_name, schemas in self.items():
             for schema in schemas:
                 yield information_schema_name, schema
@@ -440,17 +442,16 @@ class SchemaSearchMap(Dict[InformationSchema, Set[Optional[str]]]):
         if not allow_multiple_databases:
             seen = {r.database.lower() for r in self if r.database}
             if len(seen) > 1:
-                dbt.exceptions.raise_compiler_error(str(seen))
+                raise MultipleDatabasesNotAllowedError(seen)
 
         for information_schema_name, schema in self.search():
-            path = {
-                'database': information_schema_name.database,
-                'schema': schema
-            }
-            new.add(information_schema_name.incorporate(
-                path=path,
-                quote_policy={'database': False},
-                include_policy={'database': False},
-            ))
+            path = {"database": information_schema_name.database, "schema": schema}
+            new.add(
+                information_schema_name.incorporate(
+                    path=path,
+                    quote_policy={"database": False},
+                    include_policy={"database": False},
+                )
+            )
 
         return new

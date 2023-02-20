@@ -2,10 +2,15 @@ import os
 import shutil
 import stat
 import unittest
+import tarfile
+import io
+import pathspec
+from pathlib import Path
 from tempfile import mkdtemp, NamedTemporaryFile
 
 from dbt.exceptions import ExecutableError, WorkingDirectoryError
 import dbt.clients.system
+
 
 
 class SystemClient(unittest.TestCase):
@@ -47,6 +52,17 @@ class SystemClient(unittest.TestCase):
 
         self.assertTrue(written)
         self.assertEqual(self.get_profile_text(), 'NEW_TEXT')
+
+    def test__make_dir_from_str(self):
+        test_dir_str = self.tmp_dir + "/test_make_from_str/sub_dir"
+        dbt.clients.system.make_directory(test_dir_str)
+        self.assertTrue(Path(test_dir_str).is_dir())
+
+    def test__make_dir_from_pathobj(self):
+        test_dir_pathobj = Path(self.tmp_dir + "/test_make_from_pathobj/sub_dir")
+        dbt.clients.system.make_directory(test_dir_pathobj)
+        self.assertTrue(test_dir_pathobj.is_dir())
+        
 
 
 class TestRunCmd(unittest.TestCase):
@@ -148,7 +164,9 @@ class TestFindMatching(unittest.TestCase):
             file_path = os.path.dirname(named_file.name)
             relative_path = os.path.basename(file_path)
             out = dbt.clients.system.find_matching(
-                self.base_dir, [relative_path], '*.sql'
+                self.base_dir,
+                [relative_path],
+                '*.sql',
             )
             expected_output = [{
                 'searched_path': relative_path,
@@ -163,7 +181,9 @@ class TestFindMatching(unittest.TestCase):
             file_path = os.path.dirname(named_file.name)
             relative_path = os.path.basename(file_path)
             out = dbt.clients.system.find_matching(
-                self.base_dir, [relative_path], '*.sql'
+                self.base_dir,
+                [relative_path],
+                '*.sql'
             )
             expected_output = [{
                 'searched_path': relative_path,
@@ -177,7 +197,25 @@ class TestFindMatching(unittest.TestCase):
         with NamedTemporaryFile(
             prefix='sql-files', suffix='.SQLT', dir=self.tempdir
         ):
-            out = dbt.clients.system.find_matching(self.tempdir, [''], '*.sql')
+            out = dbt.clients.system.find_matching(
+                self.tempdir,
+                [''],
+                '*.sql'
+            )
+            self.assertEqual(out, [])
+    
+    def test_ignore_spec(self):
+        with NamedTemporaryFile(
+            prefix='sql-files', suffix='.sql', dir=self.tempdir
+        ):
+            out = dbt.clients.system.find_matching(
+                self.tempdir,
+                [''],
+                '*.sql',
+                pathspec.PathSpec.from_lines(
+                    pathspec.patterns.GitWildMatchPattern, "sql-files*".splitlines()
+                )
+            )
             self.assertEqual(out, [])
 
     def tearDown(self):
@@ -185,3 +223,63 @@ class TestFindMatching(unittest.TestCase):
             shutil.rmtree(self.base_dir)
         except:
             pass
+
+
+class TestUntarPackage(unittest.TestCase):
+
+    def setUp(self):
+        self.base_dir = mkdtemp()
+        self.tempdir = mkdtemp(dir=self.base_dir)
+        self.tempdest = mkdtemp(dir=self.base_dir)
+    
+    def tearDown(self):
+        try:
+            shutil.rmtree(self.base_dir)
+        except:
+            pass
+
+    def test_untar_package_success(self):
+        #  set up a valid tarball to test against
+        with NamedTemporaryFile(
+            prefix='my-package.2', suffix='.tar.gz', dir=self.tempdir, delete=False
+        ) as named_tar_file:
+            tar_file_full_path = named_tar_file.name
+            with NamedTemporaryFile(
+                prefix='a', suffix='.txt', dir=self.tempdir
+            ) as file_a:
+                file_a.write(b'some text in the text file')
+                relative_file_a = os.path.basename(file_a.name)
+                with tarfile.open(fileobj=named_tar_file, mode='w:gz') as tar:
+                    tar.addfile(tarfile.TarInfo(relative_file_a), open(file_a.name))
+
+        #  now we test can test that we can untar the file successfully
+        assert tarfile.is_tarfile(tar.name)
+        dbt.clients.system.untar_package(tar_file_full_path, self.tempdest)
+        path = Path(os.path.join(self.tempdest, relative_file_a))
+        assert path.is_file()
+
+    def test_untar_package_failure(self):
+        #  create a text file then rename it as a tar (so it's invalid)
+        with NamedTemporaryFile(
+                prefix='a', suffix='.txt', dir=self.tempdir, delete=False
+            ) as file_a:
+                file_a.write(b'some text in the text file')
+                txt_file_name = file_a.name
+                file_path= os.path.dirname(txt_file_name)
+                tar_file_path = os.path.join(file_path, 'mypackage.2.tar.gz')
+        os.rename(txt_file_name, tar_file_path)
+
+        #  now that we're set up, test that untarring the file fails
+        with self.assertRaises(tarfile.ReadError) as exc:
+            dbt.clients.system.untar_package(tar_file_path, self.tempdest)
+
+    def test_untar_package_empty(self):
+        #  create a tarball with nothing in it
+        with NamedTemporaryFile(
+            prefix='my-empty-package.2', suffix='.tar.gz', dir=self.tempdir
+        ) as named_file:
+
+            #  make sure we throw an error for the empty file
+            with self.assertRaises(tarfile.ReadError) as exc:
+                dbt.clients.system.untar_package(named_file.name, self.tempdest)
+            self.assertEqual("empty file", str(exc.exception))

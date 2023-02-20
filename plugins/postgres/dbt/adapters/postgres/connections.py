@@ -6,11 +6,14 @@ import dbt.exceptions
 from dbt.adapters.base import Credentials
 from dbt.adapters.sql import SQLConnectionManager
 from dbt.contracts.connection import AdapterResponse
-from dbt.logger import GLOBAL_LOGGER as logger
+from dbt.events import AdapterLogger
 
 from dbt.helper_types import Port
 from dataclasses import dataclass
 from typing import Optional
+
+
+logger = AdapterLogger("Postgres")
 
 
 @dataclass
@@ -27,28 +30,34 @@ class PostgresCredentials(Credentials):
     sslcert: Optional[str] = None
     sslkey: Optional[str] = None
     sslrootcert: Optional[str] = None
-    application_name: Optional[str] = 'dbt'
+    application_name: Optional[str] = "dbt"
+    retries: int = 1
 
-    _ALIASES = {
-        'dbname': 'database',
-        'pass': 'password'
-    }
+    _ALIASES = {"dbname": "database", "pass": "password"}
 
     @property
     def type(self):
-        return 'postgres'
+        return "postgres"
 
     @property
     def unique_field(self):
         return self.host
 
     def _connection_keys(self):
-        return ('host', 'port', 'user', 'database', 'schema', 'search_path',
-                'keepalives_idle', 'sslmode')
+        return (
+            "host",
+            "port",
+            "user",
+            "database",
+            "schema",
+            "search_path",
+            "keepalives_idle",
+            "sslmode",
+        )
 
 
 class PostgresConnectionManager(SQLConnectionManager):
-    TYPE = 'postgres'
+    TYPE = "postgres"
 
     @contextmanager
     def exception_handler(self, sql):
@@ -56,7 +65,7 @@ class PostgresConnectionManager(SQLConnectionManager):
             yield
 
         except psycopg2.DatabaseError as e:
-            logger.debug('Postgres error: {}'.format(str(e)))
+            logger.debug("Postgres error: {}".format(str(e)))
 
             try:
                 self.rollback_if_open()
@@ -64,24 +73,24 @@ class PostgresConnectionManager(SQLConnectionManager):
                 logger.debug("Failed to release connection!")
                 pass
 
-            raise dbt.exceptions.DatabaseException(str(e).strip()) from e
+            raise dbt.exceptions.DbtDatabaseError(str(e).strip()) from e
 
         except Exception as e:
             logger.debug("Error running SQL: {}", sql)
             logger.debug("Rolling back transaction.")
             self.rollback_if_open()
-            if isinstance(e, dbt.exceptions.RuntimeException):
+            if isinstance(e, dbt.exceptions.DbtRuntimeError):
                 # during a sql query, an internal to dbt exception was raised.
                 # this sounds a lot like a signal handler and probably has
                 # useful information, so raise it without modification.
                 raise
 
-            raise dbt.exceptions.RuntimeException(e) from e
+            raise dbt.exceptions.DbtRuntimeError(e) from e
 
     @classmethod
     def open(cls, connection):
-        if connection.state == 'open':
-            logger.debug('Connection is already open, skipping open.')
+        if connection.state == "open":
+            logger.debug("Connection is already open, skipping open.")
             return connection
 
         credentials = cls.get_credentials(connection.credentials)
@@ -89,18 +98,17 @@ class PostgresConnectionManager(SQLConnectionManager):
         # we don't want to pass 0 along to connect() as postgres will try to
         # call an invalid setsockopt() call (contrary to the docs).
         if credentials.keepalives_idle:
-            kwargs['keepalives_idle'] = credentials.keepalives_idle
+            kwargs["keepalives_idle"] = credentials.keepalives_idle
 
         # psycopg2 doesn't support search_path officially,
         # see https://github.com/psycopg/psycopg2/issues/465
         search_path = credentials.search_path
-        if search_path is not None and search_path != '':
+        if search_path is not None and search_path != "":
             # see https://postgresql.org/docs/9.5/libpq-connect.html
-            kwargs['options'] = '-c search_path={}'.format(
-                search_path.replace(' ', '\\ '))
+            kwargs["options"] = "-c search_path={}".format(search_path.replace(" ", "\\ "))
 
         if credentials.sslmode:
-            kwargs['sslmode'] = credentials.sslmode
+            kwargs["sslmode"] = credentials.sslmode
 
         if credentials.sslcert is not None:
             kwargs["sslcert"] = credentials.sslcert
@@ -112,9 +120,9 @@ class PostgresConnectionManager(SQLConnectionManager):
             kwargs["sslrootcert"] = credentials.sslrootcert
 
         if credentials.application_name:
-            kwargs['application_name'] = credentials.application_name
+            kwargs["application_name"] = credentials.application_name
 
-        try:
+        def connect():
             handle = psycopg2.connect(
                 dbname=credentials.database,
                 user=credentials.user,
@@ -122,24 +130,32 @@ class PostgresConnectionManager(SQLConnectionManager):
                 password=credentials.password,
                 port=credentials.port,
                 connect_timeout=credentials.connect_timeout,
-                **kwargs)
-
+                **kwargs,
+            )
             if credentials.role:
-                handle.cursor().execute('set role {}'.format(credentials.role))
+                handle.cursor().execute("set role {}".format(credentials.role))
+            return handle
 
-            connection.handle = handle
-            connection.state = 'open'
-        except psycopg2.Error as e:
-            logger.debug("Got an error when attempting to open a postgres "
-                         "connection: '{}'"
-                         .format(e))
+        retryable_exceptions = [
+            # OperationalError is subclassed by all psycopg2 Connection Exceptions and it's raised
+            # by generic connection timeouts without an error code. This is a limitation of
+            # psycopg2 which doesn't provide subclasses for errors without a SQLSTATE error code.
+            # The limitation has been known for a while and there are no efforts to tackle it.
+            # See: https://github.com/psycopg/psycopg2/issues/682
+            psycopg2.errors.OperationalError,
+        ]
 
-            connection.handle = None
-            connection.state = 'fail'
+        def exponential_backoff(attempt: int):
+            return attempt * attempt
 
-            raise dbt.exceptions.FailedToConnectException(str(e))
-
-        return connection
+        return cls.retry_connection(
+            connection,
+            connect=connect,
+            logger=logger,
+            retry_limit=credentials.retries,
+            retry_timeout=exponential_backoff,
+            retryable_exceptions=retryable_exceptions,
+        )
 
     def cancel(self, connection):
         connection_name = connection.name
@@ -147,10 +163,8 @@ class PostgresConnectionManager(SQLConnectionManager):
             pid = connection.handle.get_backend_pid()
         except psycopg2.InterfaceError as exc:
             # if the connection is already closed, not much to cancel!
-            if 'already closed' in str(exc):
-                logger.debug(
-                    f'Connection {connection_name} was already closed'
-                )
+            if "already closed" in str(exc):
+                logger.debug(f"Connection {connection_name} was already closed")
                 return
             # probably bad, re-raise it
             raise
@@ -173,14 +187,6 @@ class PostgresConnectionManager(SQLConnectionManager):
         message = str(cursor.statusmessage)
         rows = cursor.rowcount
         status_message_parts = message.split() if message is not None else []
-        status_messsage_strings = [
-            part
-            for part in status_message_parts
-            if not part.isdigit()
-        ]
-        code = ' '.join(status_messsage_strings)
-        return AdapterResponse(
-            _message=message,
-            code=code,
-            rows_affected=rows
-        )
+        status_messsage_strings = [part for part in status_message_parts if not part.isdigit()]
+        code = " ".join(status_messsage_strings)
+        return AdapterResponse(_message=message, code=code, rows_affected=rows)

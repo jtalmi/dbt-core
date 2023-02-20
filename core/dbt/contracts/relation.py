@@ -1,29 +1,30 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import (
-    Optional, Dict,
+    Optional,
+    Dict,
 )
 from typing_extensions import Protocol
 
 from dbt.dataclass_schema import dbtClassMixin, StrEnum
 
 from dbt.contracts.util import Replaceable
-from dbt.exceptions import raise_dataclass_not_dict, CompilationException
+from dbt.exceptions import CompilationError, DataclassNotDictError
 from dbt.utils import deep_merge
 
 
 class RelationType(StrEnum):
-    Table = 'table'
-    View = 'view'
-    CTE = 'cte'
-    MaterializedView = 'materializedview'
-    External = 'external'
+    Table = "table"
+    View = "view"
+    CTE = "cte"
+    MaterializedView = "materializedview"
+    External = "external"
 
 
 class ComponentName(StrEnum):
-    Database = 'database'
-    Schema = 'schema'
-    Identifier = 'identifier'
+    Database = "database"
+    Schema = "schema"
+    Identifier = "identifier"
 
 
 class HasQuoting(Protocol):
@@ -42,10 +43,10 @@ class FakeAPIObject(dbtClassMixin, Replaceable, Mapping):
             raise KeyError(key) from None
 
     def __iter__(self):
-        raise_dataclass_not_dict(self)
+        raise DataclassNotDictError(self)
 
     def __len__(self):
-        raise_dataclass_not_dict(self)
+        raise DataclassNotDictError(self)
 
     def incorporate(self, **kwargs):
         value = self.to_dict(omit_none=True)
@@ -68,8 +69,7 @@ class Policy(FakeAPIObject):
             return self.identifier
         else:
             raise ValueError(
-                'Got a key of {}, expected one of {}'
-                .format(key, list(ComponentName))
+                "Got a key of {}, expected one of {}".format(key, list(ComponentName))
             )
 
     def replace_dict(self, dct: Dict[ComponentName, bool]):
@@ -88,17 +88,11 @@ class Path(FakeAPIObject):
     def __post_init__(self):
         # handle pesky jinja2.Undefined sneaking in here and messing up rende
         if not isinstance(self.database, (type(None), str)):
-            raise CompilationException(
-                'Got an invalid path database: {}'.format(self.database)
-            )
+            raise CompilationError("Got an invalid path database: {}".format(self.database))
         if not isinstance(self.schema, (type(None), str)):
-            raise CompilationException(
-                'Got an invalid path schema: {}'.format(self.schema)
-            )
+            raise CompilationError("Got an invalid path schema: {}".format(self.schema))
         if not isinstance(self.identifier, (type(None), str)):
-            raise CompilationException(
-                'Got an invalid path identifier: {}'.format(self.identifier)
-            )
+            raise CompilationError("Got an invalid path identifier: {}".format(self.identifier))
 
     def get_lowered_part(self, key: ComponentName) -> Optional[str]:
         part = self.get_part(key)
@@ -115,8 +109,7 @@ class Path(FakeAPIObject):
             return self.identifier
         else:
             raise ValueError(
-                'Got a key of {}, expected one of {}'
-                .format(key, list(ComponentName))
+                "Got a key of {}, expected one of {}".format(key, list(ComponentName))
             )
 
     def replace_dict(self, dct: Dict[ComponentName, str]):

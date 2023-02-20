@@ -11,6 +11,13 @@ from dbt.node_types import NodeType
 
 import networkx as nx
 
+from dbt import flags
+
+from argparse import Namespace
+from dbt.contracts.project import UserConfig
+
+flags.set_from_args(Namespace(), UserConfig())
+
 
 def _get_graph():
     integer_graph = nx.balanced_tree(2, 2, nx.DiGraph())
@@ -119,7 +126,12 @@ def test_run_specs(include, exclude, expected):
     graph = _get_graph()
     manifest = _get_manifest(graph)
     selector = graph_selector.NodeSelector(graph, manifest)
-    spec = graph_cli.parse_difference(include, exclude)
+    # TODO:  The "eager" string below needs to be replaced with programatic access
+    #  to the default value for the indirect selection parameter in 
+    # dbt.cli.params.indirect_selection
+    #
+    # Doing that is actually a little tricky, so I'm punting it to a new ticket GH #6397
+    spec = graph_cli.parse_difference(include, exclude, "eager")
     selected, _ = selector.select_nodes(spec)
 
     assert selected == expected
@@ -193,5 +205,5 @@ invalid_specs = [
 
 @pytest.mark.parametrize('invalid', invalid_specs, ids=lambda k: str(k))
 def test_invalid_specs(invalid):
-    with pytest.raises(dbt.exceptions.RuntimeException):
+    with pytest.raises(dbt.exceptions.DbtRuntimeError):
         graph_selector.SelectionCriteria.from_single_spec(invalid)

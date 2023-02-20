@@ -1,9 +1,13 @@
 from .run import ModelRunner, RunTask
-from .printer import print_snapshot_result_line
 
-from dbt.exceptions import InternalException
+from dbt.exceptions import DbtInternalError
+from dbt.events.functions import fire_event
+from dbt.events.base_types import EventLevel
+from dbt.events.types import LogSnapshotResult
 from dbt.graph import ResourceTypeSelector
 from dbt.node_types import NodeType
+from dbt.contracts.results import NodeStatus
+from dbt.utils import cast_dict_to_dict_of_strings
 
 
 class SnapshotRunner(ModelRunner):
@@ -11,26 +15,30 @@ class SnapshotRunner(ModelRunner):
         return "snapshot {}".format(self.get_node_representation())
 
     def print_result_line(self, result):
-        print_snapshot_result_line(
-            result,
-            self.get_node_representation(),
-            self.node_index,
-            self.num_nodes)
+        model = result.node
+        cfg = model.config.to_dict(omit_none=True)
+        level = EventLevel.ERROR if result.status == NodeStatus.Error else EventLevel.INFO
+        fire_event(
+            LogSnapshotResult(
+                status=result.status,
+                description=self.get_node_representation(),
+                cfg=cast_dict_to_dict_of_strings(cfg),
+                index=self.node_index,
+                total=self.num_nodes,
+                execution_time=result.execution_time,
+                node_info=model.node_info,
+            ),
+            level=level,
+        )
 
 
 class SnapshotTask(RunTask):
     def raise_on_first_error(self):
         return False
 
-    def defer_to_manifest(self, adapter, selected_uids):
-        # snapshots don't defer
-        return
-
     def get_node_selector(self):
         if self.manifest is None or self.graph is None:
-            raise InternalException(
-                'manifest and graph must be set to get perform node selection'
-            )
+            raise DbtInternalError("manifest and graph must be set to get perform node selection")
         return ResourceTypeSelector(
             graph=self.graph,
             manifest=self.manifest,

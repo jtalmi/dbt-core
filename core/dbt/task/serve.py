@@ -1,46 +1,28 @@
-import shutil
 import os
+import shutil
+import socketserver
 import webbrowser
+from http.server import SimpleHTTPRequestHandler
+
+import click
 
 from dbt.include.global_project import DOCS_INDEX_FILE_PATH
-from http.server import SimpleHTTPRequestHandler
-from socketserver import TCPServer
-from dbt.logger import GLOBAL_LOGGER as logger
-
 from dbt.task.base import ConfiguredTask
 
 
 class ServeTask(ConfiguredTask):
     def run(self):
         os.chdir(self.config.target_path)
+        shutil.copyfile(DOCS_INDEX_FILE_PATH, "index.html")
 
         port = self.args.port
 
-        shutil.copyfile(DOCS_INDEX_FILE_PATH, 'index.html')
+        if self.args.browser:
+            webbrowser.open_new_tab(f"http://localhost:{port}")
 
-        logger.info("Serving docs at 0.0.0.0:{}".format(port))
-        logger.info(
-            "To access from your browser, navigate to:  http://localhost:{}"
-            .format(port)
-        )
-        logger.info("Press Ctrl+C to exit.\n\n")
-
-        # mypy doesn't think SimpleHTTPRequestHandler is ok here, but it is
-        httpd = TCPServer(  # type: ignore
-            ('0.0.0.0', port),
-            SimpleHTTPRequestHandler  # type: ignore
-        )  # type: ignore
-
-        if self.args.open_browser:
-            try:
-                webbrowser.open_new_tab(f'http://127.0.0.1:{port}')
-            except webbrowser.Error:
-                pass
-
-        try:
-            httpd.serve_forever()  # blocks
-        finally:
-            httpd.shutdown()
-            httpd.server_close()
-
-        return None
+        with socketserver.TCPServer(("", port), SimpleHTTPRequestHandler) as httpd:
+            click.echo(f"Serving docs at {port}")
+            click.echo(f"To access from your browser, navigate to: http://localhost:{port}")
+            click.echo("\n\n")
+            click.echo("Press Ctrl+C to exit.")
+            httpd.serve_forever()

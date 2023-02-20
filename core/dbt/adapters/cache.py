@@ -1,23 +1,24 @@
-from collections import namedtuple
-from copy import deepcopy
-from typing import List, Iterable, Optional, Dict, Set, Tuple, Any
 import threading
+from copy import deepcopy
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from dbt.logger import CACHE_LOGGER as logger
+from dbt.adapters.reference_keys import (
+    _make_ref_key,
+    _make_ref_key_msg,
+    _make_msg_from_ref_key,
+    _ReferenceKey,
+)
+from dbt.exceptions import (
+    DependentLinkNotCachedError,
+    NewNameAlreadyInCacheError,
+    NoneRelationFoundError,
+    ReferencedLinkNotCachedError,
+    TruncatedModelNameCausedCollisionError,
+)
+from dbt.events.functions import fire_event, fire_event_if
+from dbt.events.types import CacheAction, CacheDumpGraph
+from dbt.flags import get_flags
 from dbt.utils import lowercase
-import dbt.exceptions
-
-_ReferenceKey = namedtuple('_ReferenceKey', 'database schema identifier')
-
-
-def _make_key(relation) -> _ReferenceKey:
-    """Make _ReferenceKeys with lowercase values for the cache so we don't have
-    to keep track of quoting
-    """
-    # databases and schemas can both be None
-    return _ReferenceKey(lowercase(relation.database),
-                         lowercase(relation.schema),
-                         lowercase(relation.identifier))
 
 
 def dot_separated(key: _ReferenceKey) -> str:
@@ -25,7 +26,7 @@ def dot_separated(key: _ReferenceKey) -> str:
 
     :param _ReferenceKey key: The key to stringify.
     """
-    return '.'.join(map(str, key))
+    return ".".join(map(str, key))
 
 
 class _CachedRelation:
@@ -37,14 +38,15 @@ class _CachedRelation:
         that refer to this relation.
     :attr BaseRelation inner: The underlying dbt relation.
     """
+
     def __init__(self, inner):
         self.referenced_by = {}
         self.inner = inner
 
     def __str__(self) -> str:
-        return (
-            '_CachedRelation(database={}, schema={}, identifier={}, inner={})'
-        ).format(self.database, self.schema, self.identifier, self.inner)
+        return ("_CachedRelation(database={}, schema={}, identifier={}, inner={})").format(
+            self.database, self.schema, self.identifier, self.inner
+        )
 
     @property
     def database(self) -> Optional[str]:
@@ -76,9 +78,9 @@ class _CachedRelation:
 
         :return _ReferenceKey: A key for this relation.
         """
-        return _make_key(self)
+        return _make_ref_key(self)
 
-    def add_reference(self, referrer: '_CachedRelation'):
+    def add_reference(self, referrer: "_CachedRelation"):
         """Add a reference from referrer to self, indicating that if this node
         were drop...cascaded, the referrer would be dropped as well.
 
@@ -122,9 +124,9 @@ class _CachedRelation:
         # table_name is ever anything but the identifier (via .create())
         self.inner = self.inner.incorporate(
             path={
-                'database': new_relation.inner.database,
-                'schema': new_relation.inner.schema,
-                'identifier': new_relation.inner.identifier
+                "database": new_relation.inner.database,
+                "schema": new_relation.inner.schema,
+                "identifier": new_relation.inner.identifier,
             },
         )
 
@@ -139,10 +141,7 @@ class _CachedRelation:
         :raises InternalError: If the new key already exists.
         """
         if new_key in self.referenced_by:
-            dbt.exceptions.raise_cache_inconsistent(
-                'in rename of "{}" -> "{}", new name is in the cache already'
-                .format(old_key, new_key)
-            )
+            raise NewNameAlreadyInCacheError(old_key, new_key)
 
         if old_key not in self.referenced_by:
             return
@@ -157,12 +156,6 @@ class _CachedRelation:
         return [dot_separated(r) for r in self.referenced_by]
 
 
-def lazy_log(msg, func):
-    if logger.disabled:
-        return
-    logger.debug(msg.format(func()))
-
-
 class RelationsCache:
     """A cache of the relations known to dbt. Keeps track of relationships
     declared between tables and handles renames/drops as a real database would.
@@ -172,13 +165,16 @@ class RelationsCache:
         The adapters also hold this lock while filling the cache.
     :attr Set[str] schemas: The set of known/cached schemas, all lowercased.
     """
+
     def __init__(self) -> None:
         self.relations: Dict[_ReferenceKey, _CachedRelation] = {}
         self.lock = threading.RLock()
         self.schemas: Set[Tuple[Optional[str], Optional[str]]] = set()
 
     def add_schema(
-        self, database: Optional[str], schema: Optional[str],
+        self,
+        database: Optional[str],
+        schema: Optional[str],
     ) -> None:
         """Add a schema to the set of known schemas (case-insensitive)
 
@@ -188,7 +184,9 @@ class RelationsCache:
         self.schemas.add((lowercase(database), lowercase(schema)))
 
     def drop_schema(
-        self, database: Optional[str], schema: Optional[str],
+        self,
+        database: Optional[str],
+        schema: Optional[str],
     ) -> None:
         """Drop the given schema and remove it from the set of known schemas.
 
@@ -232,10 +230,7 @@ class RelationsCache:
         # self.relations or any cache entry's referenced_by during iteration
         # it's a runtime error!
         with self.lock:
-            return {
-                dot_separated(k): v.dump_graph_entry()
-                for k, v in self.relations.items()
-            }
+            return {dot_separated(k): v.dump_graph_entry() for k, v in self.relations.items()}
 
     def _setdefault(self, relation: _CachedRelation):
         """Add a relation to the cache, or return it if it already exists.
@@ -262,22 +257,17 @@ class RelationsCache:
         if referenced is None:
             return
         if referenced is None:
-            dbt.exceptions.raise_cache_inconsistent(
-                'in add_link, referenced link key {} not in cache!'
-                .format(referenced_key)
-            )
+            raise ReferencedLinkNotCachedError(referenced_key)
 
         dependent = self.relations.get(dependent_key)
         if dependent is None:
-            dbt.exceptions.raise_cache_inconsistent(
-                'in add_link, dependent link key {} not in cache!'
-                .format(dependent_key)
-            )
+            raise DependentLinkNotCachedError(dependent_key)
 
         assert dependent is not None  # we just raised!
 
         referenced.add_reference(dependent)
 
+    # This is called in plugins/postgres/dbt/adapters/postgres/impl.py
     def add_link(self, referenced, dependent):
         """Add a link between two relations to the database. If either relation
         does not exist, it will be added as an "external" relation.
@@ -292,33 +282,33 @@ class RelationsCache:
         :param BaseRelation dependent: The dependent model.
         :raises InternalError: If either entry does not exist.
         """
-        ref_key = _make_key(referenced)
+        ref_key = _make_ref_key(referenced)
+        dep_key = _make_ref_key(dependent)
         if (ref_key.database, ref_key.schema) not in self:
             # if we have not cached the referenced schema at all, we must be
             # referring to a table outside our control. There's no need to make
             # a link - we will never drop the referenced relation during a run.
-            logger.debug(
-                '{dep!s} references {ref!s} but {ref.database}.{ref.schema} '
-                'is not in the cache, skipping assumed external relation'
-                .format(dep=dependent, ref=ref_key)
+            fire_event(
+                CacheAction(
+                    ref_key=_make_msg_from_ref_key(ref_key),
+                    ref_key_2=_make_msg_from_ref_key(dep_key),
+                )
             )
             return
         if ref_key not in self.relations:
             # Insert a dummy "external" relation.
-            referenced = referenced.replace(
-                type=referenced.External
-            )
+            referenced = referenced.replace(type=referenced.External)
             self.add(referenced)
-
-        dep_key = _make_key(dependent)
         if dep_key not in self.relations:
             # Insert a dummy "external" relation.
-            dependent = dependent.replace(
-                type=referenced.External
-            )
+            dependent = dependent.replace(type=referenced.External)
             self.add(dependent)
-        logger.debug(
-            'adding link, {!s} references {!s}'.format(dep_key, ref_key)
+        fire_event(
+            CacheAction(
+                action="add_link",
+                ref_key=_make_msg_from_ref_key(dep_key),
+                ref_key_2=_make_msg_from_ref_key(ref_key),
+            )
         )
         with self.lock:
             self._add_link(ref_key, dep_key)
@@ -329,15 +319,20 @@ class RelationsCache:
 
         :param BaseRelation relation: The underlying relation.
         """
+        flags = get_flags()
         cached = _CachedRelation(relation)
-        logger.debug('Adding relation: {!s}'.format(cached))
-
-        lazy_log('before adding: {!s}', self.dump_graph)
+        fire_event_if(
+            flags.LOG_CACHE_EVENTS,
+            lambda: CacheDumpGraph(before_after="before", action="adding", dump=self.dump_graph()),
+        )
+        fire_event(CacheAction(action="add_relation", ref_key=_make_ref_key_msg(cached)))
 
         with self.lock:
             self._setdefault(cached)
-
-        lazy_log('after adding: {!s}', self.dump_graph)
+        fire_event_if(
+            flags.LOG_CACHE_EVENTS,
+            lambda: CacheDumpGraph(before_after="after", action="adding", dump=self.dump_graph()),
+        )
 
     def _remove_refs(self, keys):
         """Removes all references to all entries in keys. This does not
@@ -352,22 +347,6 @@ class RelationsCache:
         for cached in self.relations.values():
             cached.release_references(keys)
 
-    def _drop_cascade_relation(self, dropped):
-        """Drop the given relation and cascade it appropriately to all
-        dependent relations.
-
-        :param _CachedRelation dropped: An existing _CachedRelation to drop.
-        """
-        if dropped not in self.relations:
-            logger.debug('dropped a nonexistent relationship: {!s}'
-                         .format(dropped))
-            return
-        consequences = self.relations[dropped].collect_consequences()
-        logger.debug(
-            'drop {} is cascading to {}'.format(dropped, consequences)
-        )
-        self._remove_refs(consequences)
-
     def drop(self, relation):
         """Drop the named relation and cascade it appropriately to all
         dependent relations.
@@ -379,10 +358,22 @@ class RelationsCache:
         :param str schema: The schema of the relation to drop.
         :param str identifier: The identifier of the relation to drop.
         """
-        dropped = _make_key(relation)
-        logger.debug('Dropping relation: {!s}'.format(dropped))
+        dropped_key = _make_ref_key(relation)
+        dropped_key_msg = _make_ref_key_msg(relation)
+        fire_event(CacheAction(action="drop_relation", ref_key=dropped_key_msg))
         with self.lock:
-            self._drop_cascade_relation(dropped)
+            if dropped_key not in self.relations:
+                fire_event(CacheAction(action="drop_missing_relation", ref_key=dropped_key_msg))
+                return
+            consequences = self.relations[dropped_key].collect_consequences()
+            # convert from a list of _ReferenceKeys to a list of ReferenceKeyMsgs
+            consequence_msgs = [_make_msg_from_ref_key(key) for key in consequences]
+            fire_event(
+                CacheAction(
+                    action="drop_cascade", ref_key=dropped_key_msg, ref_list=consequence_msgs
+                )
+            )
+            self._remove_refs(consequences)
 
     def _rename_relation(self, old_key, new_relation):
         """Rename a relation named old_key to new_key, updating references.
@@ -398,15 +389,20 @@ class RelationsCache:
         relation = self.relations.pop(old_key)
         new_key = new_relation.key()
 
-        # relaton has to rename its innards, so it needs the _CachedRelation.
+        # relation has to rename its innards, so it needs the _CachedRelation.
         relation.rename(new_relation)
         # update all the relations that refer to it
         for cached in self.relations.values():
             if cached.is_referenced_by(old_key):
-                logger.debug(
-                    'updated reference from {0} -> {2} to {1} -> {2}'
-                    .format(old_key, new_key, cached.key())
+                fire_event(
+                    CacheAction(
+                        action="update_reference",
+                        ref_key=_make_ref_key_msg(old_key),
+                        ref_key_2=_make_ref_key_msg(new_key),
+                        ref_key_3=_make_ref_key_msg(cached.key()),
+                    )
                 )
+
                 cached.rename_key(old_key, new_key)
 
         self.relations[new_key] = relation
@@ -429,15 +425,13 @@ class RelationsCache:
         :raises InternalError: If the new key is already present.
         """
         if new_key in self.relations:
-            dbt.exceptions.raise_cache_inconsistent(
-                'in rename, new key {} already in cache: {}'
-                .format(new_key, list(self.relations.keys()))
-            )
+            # Tell user when collision caused by model names truncated during
+            # materialization.
+            raise TruncatedModelNameCausedCollisionError(new_key, self.relations)
 
         if old_key not in self.relations:
-            logger.debug(
-                'old key {} not found in self.relations, assuming temporary'
-                .format(old_key)
+            fire_event(
+                CacheAction(action="temporary_relation", ref_key=_make_msg_from_ref_key(old_key))
             )
             return False
         return True
@@ -454,13 +448,20 @@ class RelationsCache:
         :param BaseRelation new: The new relation name information.
         :raises InternalError: If the new key is already present.
         """
-        old_key = _make_key(old)
-        new_key = _make_key(new)
-        logger.debug('Renaming relation {!s} to {!s}'.format(
-            old_key, new_key
-        ))
-
-        lazy_log('before rename: {!s}', self.dump_graph)
+        old_key = _make_ref_key(old)
+        new_key = _make_ref_key(new)
+        fire_event(
+            CacheAction(
+                action="rename_relation",
+                ref_key=_make_msg_from_ref_key(old_key),
+                ref_key_2=_make_msg_from_ref_key(new),
+            )
+        )
+        flags = get_flags()
+        fire_event_if(
+            flags.LOG_CACHE_EVENTS,
+            lambda: CacheDumpGraph(before_after="before", action="rename", dump=self.dump_graph()),
+        )
 
         with self.lock:
             if self._check_rename_constraints(old_key, new_key):
@@ -468,11 +469,12 @@ class RelationsCache:
             else:
                 self._setdefault(_CachedRelation(new))
 
-        lazy_log('after rename: {!s}', self.dump_graph)
+        fire_event_if(
+            flags.LOG_CACHE_EVENTS,
+            lambda: CacheDumpGraph(before_after="after", action="rename", dump=self.dump_graph()),
+        )
 
-    def get_relations(
-        self, database: Optional[str], schema: Optional[str]
-    ) -> List[Any]:
+    def get_relations(self, database: Optional[str], schema: Optional[str]) -> List[Any]:
         """Case-insensitively yield all relations matching the given schema.
 
         :param str schema: The case-insensitive schema name to list from.
@@ -483,15 +485,13 @@ class RelationsCache:
         schema = lowercase(schema)
         with self.lock:
             results = [
-                r.inner for r in self.relations.values()
-                if (lowercase(r.schema) == schema and
-                    lowercase(r.database) == database)
+                r.inner
+                for r in self.relations.values()
+                if (lowercase(r.schema) == schema and lowercase(r.database) == database)
             ]
 
         if None in results:
-            dbt.exceptions.raise_cache_inconsistent(
-                'in get_relations, a None relation was found in the cache!'
-            )
+            raise NoneRelationFoundError()
         return results
 
     def clear(self):
@@ -518,6 +518,6 @@ class RelationsCache:
         """
         for relation in to_remove:
             # it may have been cascaded out already
-            drop_key = _make_key(relation)
+            drop_key = _make_ref_key(relation)
             if drop_key in self.relations:
                 self.drop(drop_key)

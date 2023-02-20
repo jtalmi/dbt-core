@@ -1,24 +1,23 @@
 import os
 from typing import Any, Dict, Optional
 
+from dbt.constants import SECRET_ENV_PREFIX, DEFAULT_ENV_PLACEHOLDER
 from dbt.contracts.connection import AdapterRequiredConfig
-from dbt.logger import SECRET_ENV_PREFIX
 from dbt.node_types import NodeType
 from dbt.utils import MultiDict
 
 from dbt.context.base import contextproperty, contextmember, Var
 from dbt.context.target import TargetContext
-from dbt.exceptions import raise_parsing_error
+from dbt.exceptions import EnvVarMissingError, SecretEnvVarLocationError
 
 
 class ConfiguredContext(TargetContext):
     # subclasses are SchemaYamlContext, MacroResolvingContext, ManifestContext
     config: AdapterRequiredConfig
 
-    def __init__(
-        self, config: AdapterRequiredConfig
-    ) -> None:
-        super().__init__(config, config.cli_vars)
+    def __init__(self, config: AdapterRequiredConfig) -> None:
+        super().__init__(config.to_target_dict(), config.cli_vars)
+        self.config = config
 
     @contextproperty
     def project_name(self) -> str:
@@ -67,7 +66,7 @@ class ConfiguredVar(Var):
         return self.get_missing_var(var_name)
 
 
-class SchemaYamlVars():
+class SchemaYamlVars:
     def __init__(self):
         self.env_vars = {}
         self.vars = {}
@@ -82,25 +81,31 @@ class SchemaYamlContext(ConfiguredContext):
 
     @contextproperty
     def var(self) -> ConfiguredVar:
-        return ConfiguredVar(
-            self._ctx, self.config, self._project_name
-        )
+        return ConfiguredVar(self._ctx, self.config, self._project_name)
 
     @contextmember
     def env_var(self, var: str, default: Optional[str] = None) -> str:
         return_value = None
+        if var.startswith(SECRET_ENV_PREFIX):
+            raise SecretEnvVarLocationError(var)
         if var in os.environ:
             return_value = os.environ[var]
         elif default is not None:
             return_value = default
 
         if return_value is not None:
-            if not var.startswith(SECRET_ENV_PREFIX) and self.schema_yaml_vars:
-                self.schema_yaml_vars.env_vars[var] = return_value
+            if self.schema_yaml_vars:
+                # If the environment variable is set from a default, store a string indicating
+                # that so we can skip partial parsing.  Otherwise the file will be scheduled for
+                # reparsing. If the default changes, the file will have been updated and therefore
+                # will be scheduled for reparsing anyways.
+                self.schema_yaml_vars.env_vars[var] = (
+                    return_value if var in os.environ else DEFAULT_ENV_PLACEHOLDER
+                )
+
             return return_value
         else:
-            msg = f"Env var required but not provided: '{var}'"
-            raise_parsing_error(msg)
+            raise EnvVarMissingError(var)
 
 
 class MacroResolvingContext(ConfiguredContext):
@@ -109,13 +114,11 @@ class MacroResolvingContext(ConfiguredContext):
 
     @contextproperty
     def var(self) -> ConfiguredVar:
-        return ConfiguredVar(
-            self._ctx, self.config, self.config.project_name
-        )
+        return ConfiguredVar(self._ctx, self.config, self.config.project_name)
 
 
 def generate_schema_yml_context(
-        config: AdapterRequiredConfig, project_name: str, schema_yaml_vars: SchemaYamlVars = None
+    config: AdapterRequiredConfig, project_name: str, schema_yaml_vars: SchemaYamlVars = None
 ) -> Dict[str, Any]:
     ctx = SchemaYamlContext(config, project_name, schema_yaml_vars)
     return ctx.to_dict()

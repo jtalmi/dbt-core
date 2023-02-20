@@ -2,6 +2,7 @@ import os
 import unittest
 from unittest import mock
 
+from argparse import Namespace
 import copy
 from collections import namedtuple
 from itertools import product
@@ -12,42 +13,47 @@ import pytest
 import dbt.flags
 import dbt.version
 from dbt import tracking
+from dbt.adapters.base.plugin import AdapterPlugin
 from dbt.contracts.files import FileHash
 from dbt.contracts.graph.manifest import Manifest, ManifestMetadata
-from dbt.contracts.graph.parsed import (
-    ParsedModelNode,
+from dbt.contracts.graph.nodes import (
+    ModelNode,
     DependsOn,
     NodeConfig,
-    ParsedSeedNode,
-    ParsedSourceDefinition,
-    ParsedExposure,
-    ParsedMetric
+    SeedNode,
+    SourceDefinition,
+    Exposure,
+    Metric,
+    Group,
 )
 
 from dbt.contracts.graph.unparsed import (
     ExposureType,
-    ExposureOwner,
+    Owner,
     MaturityType,
-    MetricFilter
+    MetricFilter,
+    MetricTime
 )
 
-from dbt.contracts.graph.compiled import CompiledModelNode
+from dbt.events.functions import reset_metadata_vars
+from dbt.flags import set_from_args
+
 from dbt.node_types import NodeType
 import freezegun
 
-from .utils import MockMacro, MockDocumentation, MockSource, MockNode, MockMaterialization, MockGenerateMacro
+from .utils import MockMacro, MockDocumentation, MockSource, MockNode, MockMaterialization, MockGenerateMacro, inject_plugin
 
 
 REQUIRED_PARSED_NODE_KEYS = frozenset({
-    'alias', 'tags', 'config', 'unique_id', 'refs', 'sources', 'meta',
+    'alias', 'tags', 'config', 'unique_id', 'refs', 'sources', 'metrics', 'meta',
     'depends_on', 'database', 'schema', 'name', 'resource_type',
-    'package_name', 'root_path', 'path', 'original_file_path', 'raw_sql',
+    'package_name', 'path', 'original_file_path', 'raw_code', 'language',
     'description', 'columns', 'fqn', 'build_path', 'compiled_path', 'patch_path', 'docs',
-    'deferred', 'checksum', 'unrendered_config', 'created_at',
+    'deferred', 'checksum', 'unrendered_config', 'created_at', 'config_call_dict', 'relation_name', 'constraints_enabled'
 })
 
 REQUIRED_COMPILED_NODE_KEYS = frozenset(REQUIRED_PARSED_NODE_KEYS | {
-    'compiled', 'extra_ctes_injected', 'extra_ctes', 'compiled_sql',
+    'compiled', 'extra_ctes_injected', 'extra_ctes', 'compiled_code',
     'relation_name'
 })
 
@@ -57,6 +63,8 @@ ENV_KEY_NAME = 'KEY' if os.name == 'nt' else 'key'
 
 class ManifestTest(unittest.TestCase):
     def setUp(self):
+        reset_metadata_vars()
+
         # TODO: why is this needed for tests in this module to pass?
         tracking.active_user = None
 
@@ -75,10 +83,10 @@ class ManifestTest(unittest.TestCase):
         })
 
         self.exposures = {
-            'exposure.root.my_exposure': ParsedExposure(
+            'exposure.root.my_exposure': Exposure(
                 name='my_exposure',
                 type=ExposureType.Dashboard,
-                owner=ExposureOwner(email='some@email.com'),
+                owner=Owner(email='some@email.com'),
                 resource_type=NodeType.Exposure,
                 description='Test description',
                 maturity=MaturityType.High,
@@ -89,20 +97,19 @@ class ManifestTest(unittest.TestCase):
                 fqn=['root', 'my_exposure'],
                 unique_id='exposure.root.my_exposure',
                 package_name='root',
-                root_path='',
                 path='my_exposure.sql',
                 original_file_path='my_exposure.sql'
             )
         }
 
         self.metrics = {
-            'metric.root.my_metric': ParsedMetric(
+            'metric.root.my_metric': Metric(
                 name='new_customers',
                 label='New Customers',
                 model='ref("multi")',
                 description="New customers",
-                type='count',
-                sql="user_id",
+                calculation_method='count',
+                expression="user_id",
                 timestamp="signup_date",
                 time_grains=['day', 'week', 'month'],
                 dimensions=['plan', 'country'],
@@ -113,21 +120,34 @@ class ManifestTest(unittest.TestCase):
                 )],
                 meta={'is_okr': True},
                 tags=['okrs'],
+                window=MetricTime(),
                 resource_type=NodeType.Metric,
                 depends_on=DependsOn(nodes=['model.root.multi']),
                 refs=[['multi']],
                 sources=[],
+                metrics=[],
                 fqn=['root', 'my_metric'],
                 unique_id='metric.root.my_metric',
                 package_name='root',
-                root_path='',
                 path='my_metric.yml',
                 original_file_path='my_metric.yml'
             )
         }
 
+        self.groups = {
+            'group.root.my_group': Group(
+                name='my_group',
+                owner=Owner(email='some@email.com'),
+                resource_type=NodeType.Group,
+                unique_id='group.root.my_group',
+                package_name='root',
+                path='my_metric.yml',
+                original_file_path='my_metric.yml',
+            )
+        }
+
         self.nested_nodes = {
-            'model.snowplow.events': ParsedModelNode(
+            'model.snowplow.events': ModelNode(
                 name='events',
                 database='dbt',
                 schema='analytics',
@@ -138,17 +158,18 @@ class ManifestTest(unittest.TestCase):
                 package_name='snowplow',
                 refs=[],
                 sources=[],
+                metrics=[],
                 depends_on=DependsOn(),
                 config=self.model_config,
                 tags=[],
                 path='events.sql',
                 original_file_path='events.sql',
-                root_path='',
                 meta={},
-                raw_sql='does not matter',
+                language='sql',
+                raw_code='does not matter',
                 checksum=FileHash.empty(),
             ),
-            'model.root.events': ParsedModelNode(
+            'model.root.events': ModelNode(
                 name='events',
                 database='dbt',
                 schema='analytics',
@@ -159,17 +180,18 @@ class ManifestTest(unittest.TestCase):
                 package_name='root',
                 refs=[],
                 sources=[],
+                metrics=[],
                 depends_on=DependsOn(),
                 config=self.model_config,
                 tags=[],
                 path='events.sql',
                 original_file_path='events.sql',
-                root_path='',
                 meta={},
-                raw_sql='does not matter',
+                language='sql',
+                raw_code='does not matter',
                 checksum=FileHash.empty(),
             ),
-            'model.root.dep': ParsedModelNode(
+            'model.root.dep': ModelNode(
                 name='dep',
                 database='dbt',
                 schema='analytics',
@@ -180,17 +202,18 @@ class ManifestTest(unittest.TestCase):
                 package_name='root',
                 refs=[['events']],
                 sources=[],
+                metrics=[],
                 depends_on=DependsOn(nodes=['model.root.events']),
                 config=self.model_config,
                 tags=[],
                 path='multi.sql',
                 original_file_path='multi.sql',
-                root_path='',
                 meta={},
-                raw_sql='does not matter',
+                language='sql',
+                raw_code='does not matter',
                 checksum=FileHash.empty(),
             ),
-            'model.root.nested': ParsedModelNode(
+            'model.root.nested': ModelNode(
                 name='nested',
                 database='dbt',
                 schema='analytics',
@@ -201,17 +224,18 @@ class ManifestTest(unittest.TestCase):
                 package_name='root',
                 refs=[['events']],
                 sources=[],
+                metrics=[],
                 depends_on=DependsOn(nodes=['model.root.dep']),
                 config=self.model_config,
                 tags=[],
                 path='multi.sql',
                 original_file_path='multi.sql',
-                root_path='',
                 meta={},
-                raw_sql='does not matter',
+                language='sql',
+                raw_code='does not matter',
                 checksum=FileHash.empty(),
             ),
-            'model.root.sibling': ParsedModelNode(
+            'model.root.sibling': ModelNode(
                 name='sibling',
                 database='dbt',
                 schema='analytics',
@@ -222,17 +246,18 @@ class ManifestTest(unittest.TestCase):
                 package_name='root',
                 refs=[['events']],
                 sources=[],
+                metrics=[],
                 depends_on=DependsOn(nodes=['model.root.events']),
                 config=self.model_config,
                 tags=[],
                 path='multi.sql',
                 original_file_path='multi.sql',
-                root_path='',
                 meta={},
-                raw_sql='does not matter',
+                language='sql',
+                raw_code='does not matter',
                 checksum=FileHash.empty(),
             ),
-            'model.root.multi': ParsedModelNode(
+            'model.root.multi': ModelNode(
                 name='multi',
                 database='dbt',
                 schema='analytics',
@@ -243,20 +268,21 @@ class ManifestTest(unittest.TestCase):
                 package_name='root',
                 refs=[['events']],
                 sources=[],
+                metrics=[],
                 depends_on=DependsOn(nodes=['model.root.nested', 'model.root.sibling']),
                 config=self.model_config,
                 tags=[],
                 path='multi.sql',
                 original_file_path='multi.sql',
-                root_path='',
                 meta={},
-                raw_sql='does not matter',
+                language='sql',
+                raw_code='does not matter',
                 checksum=FileHash.empty(),
             ),
         }
 
         self.sources = {
-            'source.root.my_source.my_table': ParsedSourceDefinition(
+            'source.root.my_source.my_table': SourceDefinition(
                 database='raw',
                 schema='analytics',
                 resource_type=NodeType.Source,
@@ -269,7 +295,6 @@ class ManifestTest(unittest.TestCase):
                 unique_id='source.test.my_source.my_table',
                 fqn=['test', 'my_source', 'my_table'],
                 package_name='root',
-                root_path='',
                 path='schema.yml',
                 original_file_path='schema.yml',
             ),
@@ -287,6 +312,7 @@ class ManifestTest(unittest.TestCase):
 
     def tearDown(self):
         del os.environ['DBT_ENV_CUSTOM_ENV_key']
+        reset_metadata_vars()
 
     @freezegun.freeze_time('2018-02-14T09:15:13Z')
     def test__no_nodes(self):
@@ -295,6 +321,8 @@ class ManifestTest(unittest.TestCase):
             exposures={}, metrics={}, selectors={},
             metadata=ManifestMetadata(generated_at=datetime.utcnow()),
         )
+
+        invocation_id = dbt.events.functions.EVENT_MANAGER.invocation_id
         self.assertEqual(
             manifest.writable_manifest().to_dict(omit_none=True),
             {
@@ -303,15 +331,16 @@ class ManifestTest(unittest.TestCase):
                 'macros': {},
                 'exposures': {},
                 'metrics': {},
+                'groups': {},
                 'selectors': {},
                 'parent_map': {},
                 'child_map': {},
                 'metadata': {
                     'generated_at': '2018-02-14T09:15:13Z',
-                    'dbt_schema_version': 'https://schemas.getdbt.com/dbt/manifest/v4.json',
+                    'dbt_schema_version': 'https://schemas.getdbt.com/dbt/manifest/v8.json',
                     'dbt_version': dbt.version.__version__,
                     'env': {ENV_KEY_NAME: 'value'},
-                    # invocation_id is None, so it will not be present
+                    'invocation_id': invocation_id,
                 },
                 'docs': {},
                 'disabled': {},
@@ -389,19 +418,22 @@ class ManifestTest(unittest.TestCase):
     def test__build_flat_graph(self):
         exposures = copy.copy(self.exposures)
         metrics = copy.copy(self.metrics)
+        groups = copy.copy(self.groups)
         nodes = copy.copy(self.nested_nodes)
         sources = copy.copy(self.sources)
         manifest = Manifest(nodes=nodes, sources=sources, macros={}, docs={},
                             disabled={}, files={}, exposures=exposures,
-                            metrics=metrics, selectors={})
+                            metrics=metrics, groups=groups, selectors={})
         manifest.build_flat_graph()
         flat_graph = manifest.flat_graph
         flat_exposures = flat_graph['exposures']
+        flat_groups = flat_graph['groups']
         flat_metrics = flat_graph['metrics']
         flat_nodes = flat_graph['nodes']
         flat_sources = flat_graph['sources']
-        self.assertEqual(set(flat_graph), set(['exposures', 'nodes', 'sources', 'metrics']))
+        self.assertEqual(set(flat_graph), set(['exposures', 'groups', 'nodes', 'sources', 'metrics']))
         self.assertEqual(set(flat_exposures), set(self.exposures))
+        self.assertEqual(set(flat_groups), set(self.groups))
         self.assertEqual(set(flat_metrics), set(self.metrics))
         self.assertEqual(set(flat_nodes), set(self.nested_nodes))
         self.assertEqual(set(flat_sources), set(self.sources))
@@ -411,8 +443,8 @@ class ManifestTest(unittest.TestCase):
     @mock.patch.object(tracking, 'active_user')
     def test_metadata(self, mock_user):
         mock_user.id = 'cfc9500f-dc7f-4c83-9ea7-2c581c1b38cf'
-        mock_user.invocation_id = '01234567-0123-0123-0123-0123456789ab'
-        dbt.flags.SEND_ANONYMOUS_USAGE_STATS = False
+        dbt.events.functions.EVENT_MANAGER.invocation_id = '01234567-0123-0123-0123-0123456789ab'
+        set_from_args(Namespace(SEND_ANONYMOUS_USAGE_STATS=False), None)
         now = datetime.utcnow()
         self.assertEqual(
             ManifestMetadata(
@@ -434,8 +466,8 @@ class ManifestTest(unittest.TestCase):
     @freezegun.freeze_time('2018-02-14T09:15:13Z')
     def test_no_nodes_with_metadata(self, mock_user):
         mock_user.id = 'cfc9500f-dc7f-4c83-9ea7-2c581c1b38cf'
-        mock_user.invocation_id = '01234567-0123-0123-0123-0123456789ab'
-        dbt.flags.SEND_ANONYMOUS_USAGE_STATS = False
+        dbt.events.functions.EVENT_MANAGER.invocation_id = '01234567-0123-0123-0123-0123456789ab'
+        set_from_args(Namespace(SEND_ANONYMOUS_USAGE_STATS=False), None)
         metadata = ManifestMetadata(
             project_id='098f6bcd4621d373cade4e832627b4f6',
             adapter_type='postgres',
@@ -453,13 +485,14 @@ class ManifestTest(unittest.TestCase):
                 'macros': {},
                 'exposures': {},
                 'metrics': {},
+                'groups': {},
                 'selectors': {},
                 'parent_map': {},
                 'child_map': {},
                 'docs': {},
                 'metadata': {
                     'generated_at': '2018-02-14T09:15:13Z',
-                    'dbt_schema_version': 'https://schemas.getdbt.com/dbt/manifest/v4.json',
+                    'dbt_schema_version': 'https://schemas.getdbt.com/dbt/manifest/v8.json',
                     'dbt_version': dbt.version.__version__,
                     'project_id': '098f6bcd4621d373cade4e832627b4f6',
                     'user_id': 'cfc9500f-dc7f-4c83-9ea7-2c581c1b38cf',
@@ -479,7 +512,7 @@ class ManifestTest(unittest.TestCase):
 
     def test_get_resource_fqns(self):
         nodes = copy.copy(self.nested_nodes)
-        nodes['seed.root.seed'] = ParsedSeedNode(
+        nodes['seed.root.seed'] = SeedNode(
             name='seed',
             database='dbt',
             schema='analytics',
@@ -488,15 +521,10 @@ class ManifestTest(unittest.TestCase):
             unique_id='seed.root.seed',
             fqn=['root', 'seed'],
             package_name='root',
-            refs=[['events']],
-            sources=[],
-            depends_on=DependsOn(),
             config=self.model_config,
             tags=[],
             path='seed.csv',
             original_file_path='seed.csv',
-            root_path='',
-            raw_sql='-- csv --',
             checksum=FileHash.empty(),
         )
         manifest = Manifest(nodes=nodes, sources=self.sources, macros={}, docs={},
@@ -527,6 +555,33 @@ class ManifestTest(unittest.TestCase):
         resource_fqns = manifest.get_resource_fqns()
         self.assertEqual(resource_fqns, expect)
 
+    def test__deepcopy_copies_flat_graph(self):
+        test_node = ModelNode(
+                name='events',
+                database='dbt',
+                schema='analytics',
+                alias='events',
+                resource_type=NodeType.Model,
+                unique_id='model.snowplow.events',
+                fqn=['snowplow', 'events'],
+                package_name='snowplow',
+                refs=[],
+                sources=[],
+                metrics=[],
+                depends_on=DependsOn(),
+                config=self.model_config,
+                tags=[],
+                path='events.sql',
+                original_file_path='events.sql',
+                meta={},
+                language='sql',
+                raw_code='does not matter',
+                checksum=FileHash.empty())
+
+        original = make_manifest(nodes=[test_node])
+        original.build_flat_graph()
+        copy = original.deepcopy()
+        self.assertEqual(original.flat_graph, copy.flat_graph)
 
 class MixedManifestTest(unittest.TestCase):
     def setUp(self):
@@ -545,7 +600,7 @@ class MixedManifestTest(unittest.TestCase):
         })
 
         self.nested_nodes = {
-            'model.snowplow.events': CompiledModelNode(
+            'model.snowplow.events': ModelNode(
                 name='events',
                 database='dbt',
                 schema='analytics',
@@ -561,17 +616,17 @@ class MixedManifestTest(unittest.TestCase):
                 tags=[],
                 path='events.sql',
                 original_file_path='events.sql',
-                root_path='',
-                raw_sql='does not matter',
+                language='sql',
+                raw_code='does not matter',
                 meta={},
                 compiled=True,
-                compiled_sql='also does not matter',
+                compiled_code='also does not matter',
                 extra_ctes_injected=True,
                 relation_name='"dbt"."analytics"."events"',
                 extra_ctes=[],
                 checksum=FileHash.empty(),
             ),
-            'model.root.events': CompiledModelNode(
+            'model.root.events': ModelNode(
                 name='events',
                 database='dbt',
                 schema='analytics',
@@ -587,17 +642,17 @@ class MixedManifestTest(unittest.TestCase):
                 tags=[],
                 path='events.sql',
                 original_file_path='events.sql',
-                root_path='',
-                raw_sql='does not matter',
+                raw_code='does not matter',
                 meta={},
                 compiled=True,
-                compiled_sql='also does not matter',
+                compiled_code='also does not matter',
+                language='sql',
                 extra_ctes_injected=True,
                 relation_name='"dbt"."analytics"."events"',
                 extra_ctes=[],
                 checksum=FileHash.empty(),
             ),
-            'model.root.dep': ParsedModelNode(
+            'model.root.dep': ModelNode(
                 name='dep',
                 database='dbt',
                 schema='analytics',
@@ -613,12 +668,12 @@ class MixedManifestTest(unittest.TestCase):
                 tags=[],
                 path='multi.sql',
                 original_file_path='multi.sql',
-                root_path='',
                 meta={},
-                raw_sql='does not matter',
+                language='sql',
+                raw_code='does not matter',
                 checksum=FileHash.empty(),
             ),
-            'model.root.nested': ParsedModelNode(
+            'model.root.nested': ModelNode(
                 name='nested',
                 database='dbt',
                 schema='analytics',
@@ -634,12 +689,12 @@ class MixedManifestTest(unittest.TestCase):
                 tags=[],
                 path='multi.sql',
                 original_file_path='multi.sql',
-                root_path='',
                 meta={},
-                raw_sql='does not matter',
+                language='sql',
+                raw_code='does not matter',
                 checksum=FileHash.empty(),
             ),
-            'model.root.sibling': ParsedModelNode(
+            'model.root.sibling': ModelNode(
                 name='sibling',
                 database='dbt',
                 schema='analytics',
@@ -655,12 +710,12 @@ class MixedManifestTest(unittest.TestCase):
                 tags=[],
                 path='multi.sql',
                 original_file_path='multi.sql',
-                root_path='',
                 meta={},
-                raw_sql='does not matter',
+                language='sql',
+                raw_code='does not matter',
                 checksum=FileHash.empty(),
             ),
-            'model.root.multi': ParsedModelNode(
+            'model.root.multi': ModelNode(
                 name='multi',
                 database='dbt',
                 schema='analytics',
@@ -676,9 +731,9 @@ class MixedManifestTest(unittest.TestCase):
                 tags=[],
                 path='multi.sql',
                 original_file_path='multi.sql',
-                root_path='',
                 meta={},
-                raw_sql='does not matter',
+                language='sql',
+                raw_code='does not matter',
                 checksum=FileHash.empty(),
             ),
         }
@@ -700,12 +755,13 @@ class MixedManifestTest(unittest.TestCase):
                 'sources': {},
                 'exposures': {},
                 'metrics': {},
+                'groups': {},
                 'selectors': {},
                 'parent_map': {},
                 'child_map': {},
                 'metadata': {
                     'generated_at': '2018-02-14T09:15:13Z',
-                    'dbt_schema_version': 'https://schemas.getdbt.com/dbt/manifest/v4.json',
+                    'dbt_schema_version': 'https://schemas.getdbt.com/dbt/manifest/v8.json',
                     'dbt_version': dbt.version.__version__,
                     'invocation_id': '01234567-0123-0123-0123-0123456789ab',
                     'env': {ENV_KEY_NAME: 'value'},
@@ -789,7 +845,7 @@ class MixedManifestTest(unittest.TestCase):
         manifest.build_flat_graph()
         flat_graph = manifest.flat_graph
         flat_nodes = flat_graph['nodes']
-        self.assertEqual(set(flat_graph), set(['exposures', 'metrics', 'nodes', 'sources']))
+        self.assertEqual(set(flat_graph), set(['exposures', 'groups', 'metrics', 'nodes', 'sources']))
         self.assertEqual(set(flat_nodes), set(self.nested_nodes))
         compiled_count = 0
         for node in flat_nodes.values():
@@ -1002,6 +1058,27 @@ FindMaterializationSpec = namedtuple('FindMaterializationSpec', 'macros,adapter_
 
 
 def _materialization_parameter_sets():
+    # inject the plugins used for materialization parameter tests
+    with mock.patch('dbt.adapters.base.plugin.project_name_from_path') as get_name:
+        get_name.return_value = 'foo'
+        FooPlugin = AdapterPlugin(
+            adapter=mock.MagicMock(),
+            credentials=mock.MagicMock(),
+            include_path='/path/to/root/plugin',
+        )
+        FooPlugin.adapter.type.return_value = 'foo'
+        inject_plugin(FooPlugin)
+
+        get_name.return_value = 'bar'
+        BarPlugin = AdapterPlugin(
+            adapter=mock.MagicMock(),
+            credentials=mock.MagicMock(),
+            include_path='/path/to/root/plugin',
+            dependencies=['foo'],
+        )
+        BarPlugin.adapter.type.return_value = 'bar'
+        inject_plugin(BarPlugin)
+
     sets = [
         FindMaterializationSpec(macros=[], adapter_type='foo', expected=None),
     ]
@@ -1074,6 +1151,22 @@ def _materialization_parameter_sets():
             expected=('dep', 'foo'),
         ),
     ])
+
+    # inherit from parent adapter
+    sets.extend(
+        FindMaterializationSpec(
+            macros=[MockMaterialization(project, adapter_type='foo')],
+            adapter_type='bar',
+            expected=(project, 'foo'),
+        ) for project in ['root', 'dep', 'dbt']
+    )
+    sets.extend(
+        FindMaterializationSpec(
+            macros=[MockMaterialization(project, adapter_type='foo'), MockMaterialization(project, adapter_type='bar')],
+            adapter_type='bar',
+            expected=(project, 'bar'),
+        ) for project in ['root', 'dep', 'dbt']
+    )
 
     return sets
 

@@ -1,101 +1,90 @@
+import abc
 from typing import Optional, Set, List, Dict, ClassVar
 
 import dbt.exceptions
-from dbt import ui
 
 import dbt.tracking
 
 
 class DBTDeprecation:
     _name: ClassVar[Optional[str]] = None
-    _description: ClassVar[Optional[str]] = None
+    _event: ClassVar[Optional[str]] = None
 
     @property
     def name(self) -> str:
         if self._name is not None:
             return self._name
-        raise NotImplementedError(
-            'name not implemented for {}'.format(self)
-        )
+        raise NotImplementedError("name not implemented for {}".format(self))
 
     def track_deprecation_warn(self) -> None:
         if dbt.tracking.active_user is not None:
-            dbt.tracking.track_deprecation_warn({
-                "deprecation_name": self.name
-            })
+            dbt.tracking.track_deprecation_warn({"deprecation_name": self.name})
 
     @property
-    def description(self) -> str:
-        if self._description is not None:
-            return self._description
-        raise NotImplementedError(
-            'description not implemented for {}'.format(self)
-        )
+    def event(self) -> abc.ABCMeta:
+        if self._event is not None:
+            module_path = dbt.events.types
+            class_name = self._event
+
+            try:
+                return getattr(module_path, class_name)
+            except AttributeError:
+                msg = f"Event Class `{class_name}` is not defined in `{module_path}`"
+                raise NameError(msg)
+        raise NotImplementedError("event not implemented for {}".format(self._event))
 
     def show(self, *args, **kwargs) -> None:
         if self.name not in active_deprecations:
-            desc = self.description.format(**kwargs)
-            msg = ui.line_wrap_message(
-                desc, prefix='* Deprecation Warning: '
-            )
-            dbt.exceptions.warn_or_error(msg)
+            event = self.event(**kwargs)
+            dbt.events.functions.warn_or_error(event)
             self.track_deprecation_warn()
             active_deprecations.add(self.name)
 
 
 class PackageRedirectDeprecation(DBTDeprecation):
-    _name = 'package-redirect'
-    _description = '''\
-    The `{old_name}` package is deprecated in favor of `{new_name}`. Please update
-    your `packages.yml` configuration to use `{new_name}` instead.
-    '''
+    _name = "package-redirect"
+    _event = "PackageRedirectDeprecation"
 
 
 class PackageInstallPathDeprecation(DBTDeprecation):
-    _name = 'install-packages-path'
-    _description = '''\
-    The default package install path has changed from `dbt_modules` to `dbt_packages`.
-    Please update `clean-targets` in `dbt_project.yml` and check `.gitignore` as well.
-    Or, set `packages-install-path: dbt_modules` if you'd like to keep the current value.
-    '''
+    _name = "install-packages-path"
+    _event = "PackageInstallPathDeprecation"
 
 
-class ConfigPathDeprecation(DBTDeprecation):
-    _name = 'project_config_path'
-    _description = '''\
-    The `{deprecated_path}` config has been deprecated in favor of `{exp_path}`.
-    Please update your `dbt_project.yml` configuration to reflect this change.
-    '''
+class ConfigSourcePathDeprecation(DBTDeprecation):
+    _name = "project-config-source-paths"
+    _event = "ConfigSourcePathDeprecation"
 
 
-_adapter_renamed_description = """\
-The adapter function `adapter.{old_name}` is deprecated and will be removed in
-a future release of dbt. Please use `adapter.{new_name}` instead.
-
-Documentation for {new_name} can be found here:
-
-    https://docs.getdbt.com/docs/adapter
-"""
+class ConfigDataPathDeprecation(DBTDeprecation):
+    _name = "project-config-data-paths"
+    _event = "ConfigDataPathDeprecation"
 
 
 def renamed_method(old_name: str, new_name: str):
-
     class AdapterDeprecationWarning(DBTDeprecation):
-        _name = 'adapter:{}'.format(old_name)
-        _description = _adapter_renamed_description.format(old_name=old_name,
-                                                           new_name=new_name)
+        _name = "adapter:{}".format(old_name)
+        _event = "AdapterDeprecationWarning"
 
     dep = AdapterDeprecationWarning()
     deprecations_list.append(dep)
     deprecations[dep.name] = dep
 
 
+class MetricAttributesRenamed(DBTDeprecation):
+    _name = "metric-attr-renamed"
+    _event = "MetricAttributesRenamed"
+
+
+class ExposureNameDeprecation(DBTDeprecation):
+    _name = "exposure-name"
+    _event = "ExposureNameDeprecation"
+
+
 def warn(name, *args, **kwargs):
     if name not in deprecations:
         # this should (hopefully) never happen
-        raise RuntimeError(
-            "Error showing deprecation warning: {}".format(name)
-        )
+        raise RuntimeError("Error showing deprecation warning: {}".format(name))
 
     deprecations[name].show(*args, **kwargs)
 
@@ -106,14 +95,15 @@ def warn(name, *args, **kwargs):
 active_deprecations: Set[str] = set()
 
 deprecations_list: List[DBTDeprecation] = [
-    ConfigPathDeprecation(),
+    PackageRedirectDeprecation(),
     PackageInstallPathDeprecation(),
-    PackageRedirectDeprecation()
+    ConfigSourcePathDeprecation(),
+    ConfigDataPathDeprecation(),
+    MetricAttributesRenamed(),
+    ExposureNameDeprecation(),
 ]
 
-deprecations: Dict[str, DBTDeprecation] = {
-    d.name: d for d in deprecations_list
-}
+deprecations: Dict[str, DBTDeprecation] = {d.name: d for d in deprecations_list}
 
 
 def reset_deprecations():

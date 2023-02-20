@@ -18,7 +18,7 @@ class SchemaYamlRenderer(BaseRenderer):
 
     @property
     def name(self):
-        return 'Rendering yaml'
+        return "Rendering yaml"
 
     def _is_norender_key(self, keypath: Keypath) -> bool:
         """
@@ -34,16 +34,16 @@ class SchemaYamlRenderer(BaseRenderer):
         Return True if it's tests or description - those aren't rendered now
         because they're rendered later in parse_generic_tests or process_docs.
         """
-        if len(keypath) >= 1 and keypath[0] in ('tests', 'description'):
+        if len(keypath) >= 1 and keypath[0] in ("tests", "description"):
             return True
 
-        if len(keypath) == 2 and keypath[1] in ('tests', 'description'):
+        if len(keypath) == 2 and keypath[1] in ("tests", "description"):
             return True
 
         if (
-            len(keypath) >= 3 and
-            keypath[0] == 'columns' and
-            keypath[2] in ('tests', 'description')
+            len(keypath) >= 3
+            and keypath[0] == "columns"
+            and keypath[2] in ("tests", "description")
         ):
             return True
 
@@ -54,16 +54,22 @@ class SchemaYamlRenderer(BaseRenderer):
         if len(keypath) < 1:
             return True
 
-        if self.key == 'sources':
-            if keypath[0] == 'description':
+        if self.key == "sources":
+            if keypath[0] == "description":
                 return False
-            if keypath[0] == 'tables':
+            if keypath[0] == "tables":
                 if self._is_norender_key(keypath[2:]):
                     return False
-        elif self.key == 'macros':
-            if keypath[0] == 'arguments':
+        elif self.key == "macros":
+            if keypath[0] == "arguments":
                 if self._is_norender_key(keypath[1:]):
                     return False
+            elif self._is_norender_key(keypath[0:]):
+                return False
+        elif self.key == "metrics":
+            # back compat: "expression" is new name, "sql" is old name
+            if keypath[0] in ("expression", "sql"):
+                return False
             elif self._is_norender_key(keypath[0:]):
                 return False
         else:  # models, seeds, snapshots, analyses

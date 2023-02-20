@@ -1,19 +1,22 @@
 from dataclasses import dataclass
 from typing import (
-    Type, Hashable, Optional, ContextManager, List, Generic, TypeVar, ClassVar,
-    Tuple, Union, Dict, Any
+    Type,
+    Hashable,
+    Optional,
+    ContextManager,
+    List,
+    Generic,
+    TypeVar,
+    Tuple,
+    Dict,
+    Any,
 )
 from typing_extensions import Protocol
 
 import agate
 
-from dbt.contracts.connection import (
-    Connection, AdapterRequiredConfig, AdapterResponse
-)
-from dbt.contracts.graph.compiled import (
-    CompiledNode, ManifestNode, NonSourceCompiledNode
-)
-from dbt.contracts.graph.parsed import ParsedNode, ParsedSourceDefinition
+from dbt.contracts.connection import Connection, AdapterRequiredConfig, AdapterResponse
+from dbt.contracts.graph.nodes import ResultNode, ManifestNode
 from dbt.contracts.graph.model_config import BaseConfig
 from dbt.contracts.graph.manifest import Manifest
 from dbt.contracts.relation import Policy, HasQuoting
@@ -34,7 +37,7 @@ class ColumnProtocol(Protocol):
     pass
 
 
-Self = TypeVar('Self', bound='RelationProtocol')
+Self = TypeVar("Self", bound="RelationProtocol")
 
 
 class RelationProtocol(Protocol):
@@ -43,11 +46,7 @@ class RelationProtocol(Protocol):
         ...
 
     @classmethod
-    def create_from(
-        cls: Type[Self],
-        config: HasQuoting,
-        node: Union[CompiledNode, ParsedNode, ParsedSourceDefinition],
-    ) -> Self:
+    def create_from(cls: Type[Self], config: HasQuoting, node: ResultNode) -> Self:
         ...
 
 
@@ -60,26 +59,19 @@ class CompilerProtocol(Protocol):
         node: ManifestNode,
         manifest: Manifest,
         extra_context: Optional[Dict[str, Any]] = None,
-    ) -> NonSourceCompiledNode:
+    ) -> ManifestNode:
         ...
 
 
-AdapterConfig_T = TypeVar(
-    'AdapterConfig_T', bound=AdapterConfig
-)
-ConnectionManager_T = TypeVar(
-    'ConnectionManager_T', bound=ConnectionManagerProtocol
-)
-Relation_T = TypeVar(
-    'Relation_T', bound=RelationProtocol
-)
-Column_T = TypeVar(
-    'Column_T', bound=ColumnProtocol
-)
-Compiler_T = TypeVar('Compiler_T', bound=CompilerProtocol)
+AdapterConfig_T = TypeVar("AdapterConfig_T", bound=AdapterConfig)
+ConnectionManager_T = TypeVar("ConnectionManager_T", bound=ConnectionManagerProtocol)
+Relation_T = TypeVar("Relation_T", bound=RelationProtocol)
+Column_T = TypeVar("Column_T", bound=ColumnProtocol)
+Compiler_T = TypeVar("Compiler_T", bound=CompilerProtocol)
 
 
-class AdapterProtocol(
+# TODO CT-211
+class AdapterProtocol(  # type: ignore[misc]
     Protocol,
     Generic[
         AdapterConfig_T,
@@ -87,12 +79,15 @@ class AdapterProtocol(
         Relation_T,
         Column_T,
         Compiler_T,
-    ]
+    ],
 ):
-    AdapterSpecificConfigs: ClassVar[Type[AdapterConfig_T]]
-    Column: ClassVar[Type[Column_T]]
-    Relation: ClassVar[Type[Relation_T]]
-    ConnectionManager: ClassVar[Type[ConnectionManager_T]]
+    # N.B. Technically these are ClassVars, but mypy doesn't support putting type vars in a
+    # ClassVar due to the restrictiveness of PEP-526
+    # See: https://github.com/python/mypy/issues/5144
+    AdapterSpecificConfigs: Type[AdapterConfig_T]
+    Column: Type[Column_T]
+    Relation: Type[Relation_T]
+    ConnectionManager: Type[ConnectionManager_T]
     connections: ConnectionManager_T
 
     def __init__(self, config: AdapterRequiredConfig):
@@ -156,7 +151,7 @@ class AdapterProtocol(
 
     def execute(
         self, sql: str, auto_begin: bool = False, fetch: bool = False
-    ) -> Tuple[Union[str, AdapterResponse], agate.Table]:
+    ) -> Tuple[AdapterResponse, agate.Table]:
         ...
 
     def get_compiler(self) -> Compiler_T:

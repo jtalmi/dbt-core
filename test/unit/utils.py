@@ -56,8 +56,6 @@ def profile_from_dict(profile, profile_name, cli_vars='{}'):
 
 
 def project_from_dict(project, profile, packages=None, selectors=None, cli_vars='{}'):
-    from dbt.context.target import generate_target_context
-    from dbt.config import Project
     from dbt.config.renderer import DbtProjectYamlRenderer
     from dbt.config.utils import parse_cli_vars
     if not isinstance(cli_vars, dict):
@@ -77,7 +75,7 @@ def project_from_dict(project, profile, packages=None, selectors=None, cli_vars=
 
 
 
-def config_from_parts_or_dicts(project, profile, packages=None, selectors=None, cli_vars='{}'):
+def config_from_parts_or_dicts(project, profile, packages=None, selectors=None, cli_vars={}):
     from dbt.config import Project, Profile, RuntimeConfig
     from copy import deepcopy
 
@@ -194,10 +192,13 @@ def assert_from_dict(obj, dct, cls=None):
     if cls is None:
         cls = obj.__class__
     cls.validate(dct)
+
     obj_from_dict = cls.from_dict(dct)
+
     if hasattr(obj, 'created_at'):
         obj_from_dict.created_at = 1
         obj.created_at = 1
+
     assert obj_from_dict == obj
 
 
@@ -207,6 +208,8 @@ def assert_to_dict(obj, dct):
         obj_to_dict['created_at'] = 1
     if 'created_at' in dct:
         dct['created_at'] = 1
+    if obj_to_dict != dct:
+        compare_dicts(obj_to_dict, dct)
     assert obj_to_dict == dct
 
 
@@ -222,7 +225,7 @@ def assert_fails_validation(dct, cls):
 
 
 def generate_name_macros(package):
-    from dbt.contracts.graph.parsed import ParsedMacro
+    from dbt.contracts.graph.nodes import Macro
     from dbt.node_types import NodeType
     name_sql = {}
     for component in ('database', 'schema', 'alias'):
@@ -235,13 +238,12 @@ def generate_name_macros(package):
         name_sql[name] = sql
 
     for name, sql in name_sql.items():
-        pm = ParsedMacro(
+        pm = Macro(
             name=name,
             resource_type=NodeType.Macro,
             unique_id=f'macro.{package}.{name}',
             package_name=package,
             original_file_path=normalize('macros/macro.sql'),
-            root_path='./dbt_packages/root',
             path=normalize('macros/macro.sql'),
             macro_sql=sql,
         )
@@ -255,7 +257,7 @@ class TestAdapterConversions(TestCase):
             return agate.TimeDelta()
 
         for instance in agate_helper.DEFAULT_TYPE_TESTER._possible_types:
-            if type(instance) is column_type:
+            if isinstance(instance, column_type):  # include child types
                 return instance
 
         raise ValueError(f'no tester for {column_type}')
@@ -271,7 +273,7 @@ class TestAdapterConversions(TestCase):
 
 
 def MockMacro(package, name='my_macro', **kwargs):
-    from dbt.contracts.graph.parsed import ParsedMacro
+    from dbt.contracts.graph.nodes import Macro
     from dbt.node_types import NodeType
 
     mock_kwargs = dict(
@@ -284,7 +286,7 @@ def MockMacro(package, name='my_macro', **kwargs):
     mock_kwargs.update(kwargs)
 
     macro = mock.MagicMock(
-        spec=ParsedMacro,
+        spec=Macro,
         **mock_kwargs
     )
     macro.name = name
@@ -305,9 +307,9 @@ def MockGenerateMacro(package, component='some_component', **kwargs):
 
 def MockSource(package, source_name, name, **kwargs):
     from dbt.node_types import NodeType
-    from dbt.contracts.graph.parsed import ParsedSourceDefinition
+    from dbt.contracts.graph.nodes import SourceDefinition
     src = mock.MagicMock(
-        __class__=ParsedSourceDefinition,
+        __class__=SourceDefinition,
         resource_type=NodeType.Source,
         source_name=source_name,
         package_name=package,
@@ -321,13 +323,13 @@ def MockSource(package, source_name, name, **kwargs):
 
 def MockNode(package, name, resource_type=None, **kwargs):
     from dbt.node_types import NodeType
-    from dbt.contracts.graph.parsed import ParsedModelNode, ParsedSeedNode
+    from dbt.contracts.graph.nodes import ModelNode, SeedNode
     if resource_type is None:
         resource_type = NodeType.Model
     if resource_type == NodeType.Model:
-        cls = ParsedModelNode
+        cls = ModelNode
     elif resource_type == NodeType.Seed:
-        cls = ParsedSeedNode
+        cls = SeedNode
     else:
         raise ValueError(f'I do not know how to handle {resource_type}')
     node = mock.MagicMock(
@@ -344,9 +346,9 @@ def MockNode(package, name, resource_type=None, **kwargs):
 
 def MockDocumentation(package, name, **kwargs):
     from dbt.node_types import NodeType
-    from dbt.contracts.graph.parsed import ParsedDocumentation
+    from dbt.contracts.graph.nodes import Documentation
     doc = mock.MagicMock(
-        __class__=ParsedDocumentation,
+        __class__=Documentation,
         resource_type=NodeType.Documentation,
         package_name=package,
         search_name=name,

@@ -6,7 +6,10 @@ from dbt.contracts.project import (
     ProjectPackageMetadata,
     LocalPackage,
 )
-from dbt.logger import GLOBAL_LOGGER as logger
+from dbt.events.functions import fire_event
+from dbt.events.types import DepsCreatingLocalSymlink, DepsSymlinkNotAvailable
+from dbt.config.project import PartialProject, Project
+from dbt.config.renderer import PackageRenderer
 
 
 class LocalPackageMixin:
@@ -19,7 +22,7 @@ class LocalPackageMixin:
         return self.local
 
     def source_type(self):
-        return 'local'
+        return "local"
 
 
 class LocalPinnedPackage(LocalPackageMixin, PinnedPackage):
@@ -30,7 +33,7 @@ class LocalPinnedPackage(LocalPackageMixin, PinnedPackage):
         return None
 
     def nice_version_name(self):
-        return '<local @ {}>'.format(self.local)
+        return "<local @ {}>".format(self.local)
 
     def resolve_path(self, project):
         return system.resolve_path_from_base(
@@ -38,11 +41,11 @@ class LocalPinnedPackage(LocalPackageMixin, PinnedPackage):
             project.project_root,
         )
 
-    def _fetch_metadata(self, project, renderer):
-        loaded = project.from_project_root(
-            self.resolve_path(project), renderer
-        )
-        return ProjectPackageMetadata.from_project(loaded)
+    def _fetch_metadata(
+        self, project: Project, renderer: PackageRenderer
+    ) -> ProjectPackageMetadata:
+        partial = PartialProject.from_project_root(self.resolve_path(project))
+        return partial.render_package_metadata(renderer)
 
     def install(self, project, renderer):
         src_path = self.resolve_path(project)
@@ -57,27 +60,20 @@ class LocalPinnedPackage(LocalPackageMixin, PinnedPackage):
                 system.remove_file(dest_path)
 
         if can_create_symlink:
-            logger.debug('  Creating symlink to local dependency.')
+            fire_event(DepsCreatingLocalSymlink())
             system.make_symlink(src_path, dest_path)
 
         else:
-            logger.debug('  Symlinks are not available on this '
-                         'OS, copying dependency.')
+            fire_event(DepsSymlinkNotAvailable())
             shutil.copytree(src_path, dest_path)
 
 
-class LocalUnpinnedPackage(
-    LocalPackageMixin, UnpinnedPackage[LocalPinnedPackage]
-):
+class LocalUnpinnedPackage(LocalPackageMixin, UnpinnedPackage[LocalPinnedPackage]):
     @classmethod
-    def from_contract(
-        cls, contract: LocalPackage
-    ) -> 'LocalUnpinnedPackage':
+    def from_contract(cls, contract: LocalPackage) -> "LocalUnpinnedPackage":
         return cls(local=contract.local)
 
-    def incorporate(
-        self, other: 'LocalUnpinnedPackage'
-    ) -> 'LocalUnpinnedPackage':
+    def incorporate(self, other: "LocalUnpinnedPackage") -> "LocalUnpinnedPackage":
         return LocalUnpinnedPackage(local=self.local)
 
     def resolved(self) -> LocalPinnedPackage:

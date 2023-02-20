@@ -1,59 +1,56 @@
-import os
-from collections import defaultdict
-from typing import List, Dict, Any, Tuple, cast, Optional
-
+import argparse
 import networkx as nx  # type: ignore
+import os
+import pickle
 import sqlparse
 
-from dbt import flags
+from collections import defaultdict
+from typing import List, Dict, Any, Tuple, Optional
+
+from dbt.flags import get_flags
 from dbt.adapters.factory import get_adapter
 from dbt.clients import jinja
 from dbt.clients.system import make_directory
 from dbt.context.providers import generate_runtime_model_context
 from dbt.contracts.graph.manifest import Manifest, UniqueID
-from dbt.contracts.graph.compiled import (
-    COMPILED_TYPES,
-    CompiledGenericTestNode,
+from dbt.contracts.graph.nodes import (
+    ManifestNode,
+    ManifestSQLNode,
+    GenericTestNode,
     GraphMemberNode,
     InjectedCTE,
-    ManifestNode,
-    NonSourceCompiledNode,
+    SeedNode,
 )
-from dbt.contracts.graph.parsed import ParsedNode
 from dbt.exceptions import (
-    dependency_not_found,
-    InternalException,
-    RuntimeException,
+    GraphDependencyNotFoundError,
+    DbtInternalError,
+    DbtRuntimeError,
 )
 from dbt.graph import Graph
-from dbt.logger import GLOBAL_LOGGER as logger
-from dbt.node_types import NodeType
-from dbt.utils import pluralize
+from dbt.events.functions import fire_event
+from dbt.events.types import FoundStats, WritingInjectedSQLForNode
+from dbt.events.contextvars import get_node_info
+from dbt.node_types import NodeType, ModelLanguage
+from dbt.events.format import pluralize
 import dbt.tracking
+import dbt.task.list as list_task
 
-graph_file_name = 'graph.gpickle'
-
-
-def _compiled_type_for(model: ParsedNode):
-    if type(model) not in COMPILED_TYPES:
-        raise InternalException(
-            f'Asked to compile {type(model)} node, but it has no compiled form'
-        )
-    return COMPILED_TYPES[type(model)]
+graph_file_name = "graph.gpickle"
 
 
 def print_compile_stats(stats):
     names = {
-        NodeType.Model: 'model',
-        NodeType.Test: 'test',
-        NodeType.Snapshot: 'snapshot',
-        NodeType.Analysis: 'analysis',
-        NodeType.Macro: 'macro',
-        NodeType.Operation: 'operation',
-        NodeType.Seed: 'seed file',
-        NodeType.Source: 'source',
-        NodeType.Exposure: 'exposure',
-        NodeType.Metric: 'metric'
+        NodeType.Model: "model",
+        NodeType.Test: "test",
+        NodeType.Snapshot: "snapshot",
+        NodeType.Analysis: "analysis",
+        NodeType.Macro: "macro",
+        NodeType.Operation: "operation",
+        NodeType.Seed: "seed file",
+        NodeType.Source: "source",
+        NodeType.Exposure: "exposure",
+        NodeType.Metric: "metric",
+        NodeType.Group: "group",
     }
 
     results = {k: 0 for k in names.keys()}
@@ -64,12 +61,9 @@ def print_compile_stats(stats):
         resource_counts = {k.pluralize(): v for k, v in results.items()}
         dbt.tracking.track_resource_counts(resource_counts)
 
-    stat_line = ", ".join([
-        pluralize(ct, names.get(t)) for t, ct in results.items()
-        if t in names
-    ])
+    stat_line = ", ".join([pluralize(ct, names.get(t)) for t, ct in results.items() if t in names])
 
-    logger.info("Found {}".format(stat_line))
+    fire_event(FoundStats(stat_line=stat_line))
 
 
 def _node_enabled(node: ManifestNode):
@@ -90,8 +84,12 @@ def _generate_stats(manifest: Manifest):
         stats[source.resource_type] += 1
     for exposure in manifest.exposures.values():
         stats[exposure.resource_type] += 1
+    for metric in manifest.metrics.values():
+        stats[metric.resource_type] += 1
     for macro in manifest.macros.values():
         stats[macro.resource_type] += 1
+    for group in manifest.groups.values():
+        stats[group.resource_type] += 1
     return stats
 
 
@@ -109,13 +107,13 @@ def _extend_prepended_ctes(prepended_ctes, new_prepended_ctes):
 
 
 def _get_tests_for_node(manifest: Manifest, unique_id: UniqueID) -> List[UniqueID]:
-    """ Get a list of tests that depend on the node with the
-    provided unique id """
+    """Get a list of tests that depend on the node with the
+    provided unique id"""
 
     tests = []
     if unique_id in manifest.child_map:
         for child_unique_id in manifest.child_map[unique_id]:
-            if child_unique_id.startswith('test.'):
+            if child_unique_id.startswith("test."):
                 tests.append(child_unique_id)
 
     return tests
@@ -159,7 +157,8 @@ class Linker:
         for node_id in self.graph:
             data = manifest.expect(node_id).to_dict(omit_none=True)
             out_graph.add_node(node_id, **data)
-        nx.write_gpickle(out_graph, outfile)
+        with open(outfile, "wb") as outfh:
+            pickle.dump(out_graph, outfh, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 class Compiler:
@@ -174,16 +173,15 @@ class Compiler:
     # a dict for jinja rendering of SQL
     def _create_node_context(
         self,
-        node: NonSourceCompiledNode,
+        node: ManifestSQLNode,
         manifest: Manifest,
         extra_context: Dict[str, Any],
     ) -> Dict[str, Any]:
 
-        context = generate_runtime_model_context(
-            node, self.config, manifest
-        )
+        context = generate_runtime_model_context(node, self.config, manifest)
         context.update(extra_context)
-        if isinstance(node, CompiledGenericTestNode):
+
+        if isinstance(node, GenericTestNode):
             # for test nodes, add a special keyword args value to the context
             jinja.add_rendered_test_kwargs(context, node)
 
@@ -193,14 +191,6 @@ class Compiler:
         adapter = get_adapter(self.config)
         relation_cls = adapter.Relation
         return relation_cls.add_ephemeral_prefix(name)
-
-    def _get_relation_name(self, node: ParsedNode):
-        relation_name = None
-        if node.is_relational and not node.is_ephemeral_model:
-            adapter = get_adapter(self.config)
-            relation_cls = adapter.Relation
-            relation_name = str(relation_cls.create_from(self.config, node))
-        return relation_name
 
     def _inject_ctes_into_sql(self, sql: str, ctes: List[InjectedCTE]) -> str:
         """
@@ -239,36 +229,31 @@ class Compiler:
 
         with_stmt = None
         for token in parsed.tokens:
-            if token.is_keyword and token.normalized == 'WITH':
+            if token.is_keyword and token.normalized == "WITH":
                 with_stmt = token
                 break
 
         if with_stmt is None:
             # no with stmt, add one, and inject CTEs right at the beginning
             first_token = parsed.token_first()
-            with_stmt = sqlparse.sql.Token(sqlparse.tokens.Keyword, 'with')
+            with_stmt = sqlparse.sql.Token(sqlparse.tokens.Keyword, "with")
             parsed.insert_before(first_token, with_stmt)
         else:
             # stmt exists, add a comma (which will come after injected CTEs)
-            trailing_comma = sqlparse.sql.Token(
-                sqlparse.tokens.Punctuation, ','
-            )
+            trailing_comma = sqlparse.sql.Token(sqlparse.tokens.Punctuation, ",")
             parsed.insert_after(with_stmt, trailing_comma)
 
-        token = sqlparse.sql.Token(
-            sqlparse.tokens.Keyword,
-            ", ".join(c.sql for c in ctes)
-        )
+        token = sqlparse.sql.Token(sqlparse.tokens.Keyword, ", ".join(c.sql for c in ctes))
         parsed.insert_after(with_stmt, token)
 
         return str(parsed)
 
     def _recursively_prepend_ctes(
         self,
-        model: NonSourceCompiledNode,
+        model: ManifestSQLNode,
         manifest: Manifest,
         extra_context: Optional[Dict[str, Any]],
-    ) -> Tuple[NonSourceCompiledNode, List[InjectedCTE]]:
+    ) -> Tuple[ManifestSQLNode, List[InjectedCTE]]:
         """This method is called by the 'compile_node' method. Starting
         from the node that it is passed in, it will recursively call
         itself using the 'extra_ctes'.  The 'ephemeral' models do
@@ -276,16 +261,15 @@ class Compiler:
         are rolled up into the models that refer to them by
         inserting CTEs into the SQL.
         """
-        if model.compiled_sql is None:
-            raise RuntimeException(
-                'Cannot inject ctes into an unparsed node', model
-            )
+        if model.compiled_code is None:
+            raise DbtRuntimeError("Cannot inject ctes into an unparsed node", model)
         if model.extra_ctes_injected:
             return (model, model.extra_ctes)
 
         # Just to make it plain that nothing is actually injected for this case
         if not model.extra_ctes:
-            model.extra_ctes_injected = True
+            if not isinstance(model, SeedNode):
+                model.extra_ctes_injected = True
             manifest.update_node(model)
             return (model, model.extra_ctes)
 
@@ -299,33 +283,30 @@ class Compiler:
         # ephemeral model.
         for cte in model.extra_ctes:
             if cte.id not in manifest.nodes:
-                raise InternalException(
-                    f'During compilation, found a cte reference that '
-                    f'could not be resolved: {cte.id}'
+                raise DbtInternalError(
+                    f"During compilation, found a cte reference that "
+                    f"could not be resolved: {cte.id}"
                 )
             cte_model = manifest.nodes[cte.id]
+            assert not isinstance(cte_model, SeedNode)
 
             if not cte_model.is_ephemeral_model:
-                raise InternalException(f'{cte.id} is not ephemeral')
+                raise DbtInternalError(f"{cte.id} is not ephemeral")
 
             # This model has already been compiled, so it's been
             # through here before
-            if getattr(cte_model, 'compiled', False):
-                assert isinstance(cte_model, tuple(COMPILED_TYPES.values()))
-                cte_model = cast(NonSourceCompiledNode, cte_model)
+            if getattr(cte_model, "compiled", False):
                 new_prepended_ctes = cte_model.extra_ctes
 
             # if the cte_model isn't compiled, i.e. first time here
             else:
                 # This is an ephemeral parsed model that we can compile.
                 # Compile and update the node
-                cte_model = self._compile_node(
-                    cte_model, manifest, extra_context)
+                cte_model = self._compile_node(cte_model, manifest, extra_context)
                 # recursively call this method
-                cte_model, new_prepended_ctes = \
-                    self._recursively_prepend_ctes(
-                        cte_model, manifest, extra_context
-                    )
+                cte_model, new_prepended_ctes = self._recursively_prepend_ctes(
+                    cte_model, manifest, extra_context
+                )
                 # Save compiled SQL file and sync manifest
                 self._write_node(cte_model)
                 manifest.sync_update_node(cte_model)
@@ -333,91 +314,101 @@ class Compiler:
             _extend_prepended_ctes(prepended_ctes, new_prepended_ctes)
 
             new_cte_name = self.add_ephemeral_prefix(cte_model.name)
-            rendered_sql = (
-                cte_model._pre_injected_sql or cte_model.compiled_sql
-            )
-            sql = f' {new_cte_name} as (\n{rendered_sql}\n)'
+            rendered_sql = cte_model._pre_injected_sql or cte_model.compiled_code
+            sql = f" {new_cte_name} as (\n{rendered_sql}\n)"
 
             _add_prepended_cte(prepended_ctes, InjectedCTE(id=cte.id, sql=sql))
 
         injected_sql = self._inject_ctes_into_sql(
-            model.compiled_sql,
+            model.compiled_code,
             prepended_ctes,
         )
-        model._pre_injected_sql = model.compiled_sql
-        model.compiled_sql = injected_sql
+        model._pre_injected_sql = model.compiled_code
+        model.compiled_code = injected_sql
         model.extra_ctes_injected = True
         model.extra_ctes = prepended_ctes
         model.validate(model.to_dict(omit_none=True))
-
         manifest.update_node(model)
 
         return model, prepended_ctes
 
-    # creates a compiled_node from the ManifestNode passed in,
+    # Sets compiled fields in the ManifestSQLNode passed in,
     # creates a "context" dictionary for jinja rendering,
-    # and then renders the "compiled_sql" using the node, the
-    # raw_sql and the context.
+    # and then renders the "compiled_code" using the node, the
+    # raw_code and the context.
     def _compile_node(
         self,
-        node: ManifestNode,
+        node: ManifestSQLNode,
         manifest: Manifest,
         extra_context: Optional[Dict[str, Any]] = None,
-    ) -> NonSourceCompiledNode:
+    ) -> ManifestSQLNode:
         if extra_context is None:
             extra_context = {}
 
-        logger.debug("Compiling {}".format(node.unique_id))
-
         data = node.to_dict(omit_none=True)
-        data.update({
-            'compiled': False,
-            'compiled_sql': None,
-            'extra_ctes_injected': False,
-            'extra_ctes': [],
-        })
-        compiled_node = _compiled_type_for(node).from_dict(data)
-
-        context = self._create_node_context(
-            compiled_node, manifest, extra_context
+        data.update(
+            {
+                "compiled": False,
+                "compiled_code": None,
+                "extra_ctes_injected": False,
+                "extra_ctes": [],
+            }
         )
 
-        compiled_node.compiled_sql = jinja.get_rendered(
-            node.raw_sql,
-            context,
-            node,
-        )
+        if node.language == ModelLanguage.python:
+            context = self._create_node_context(node, manifest, extra_context)
 
-        compiled_node.relation_name = self._get_relation_name(node)
+            postfix = jinja.get_rendered(
+                "{{ py_script_postfix(model) }}",
+                context,
+                node,
+            )
+            # we should NOT jinja render the python model's 'raw code'
+            node.compiled_code = f"{node.raw_code}\n\n{postfix}"
 
-        compiled_node.compiled = True
+        else:
+            context = self._create_node_context(node, manifest, extra_context)
+            node.compiled_code = jinja.get_rendered(
+                node.raw_code,
+                context,
+                node,
+            )
 
-        return compiled_node
+        # relation_name is set at parse time, except for tests without store_failures,
+        # but cli param can turn on store_failures, so we set here.
+        if (
+            node.resource_type == NodeType.Test
+            and node.relation_name is None
+            and node.is_relational
+        ):
+            adapter = get_adapter(self.config)
+            relation_cls = adapter.Relation
+            relation_name = str(relation_cls.create_from(self.config, node))
+            node.relation_name = relation_name
+
+        node.compiled = True
+
+        return node
 
     def write_graph_file(self, linker: Linker, manifest: Manifest):
         filename = graph_file_name
         graph_path = os.path.join(self.config.target_path, filename)
+        flags = get_flags()
         if flags.WRITE_JSON:
             linker.write_graph(graph_path, manifest)
 
-    def link_node(
-        self, linker: Linker, node: GraphMemberNode, manifest: Manifest
-    ):
+    def link_node(self, linker: Linker, node: GraphMemberNode, manifest: Manifest):
         linker.add_node(node.unique_id)
 
         for dependency in node.depends_on_nodes:
             if dependency in manifest.nodes:
-                linker.dependency(
-                    node.unique_id,
-                    (manifest.nodes[dependency].unique_id)
-                )
+                linker.dependency(node.unique_id, (manifest.nodes[dependency].unique_id))
             elif dependency in manifest.sources:
-                linker.dependency(
-                    node.unique_id,
-                    (manifest.sources[dependency].unique_id)
-                )
+                linker.dependency(node.unique_id, (manifest.sources[dependency].unique_id))
+            elif dependency in manifest.metrics:
+                linker.dependency(node.unique_id, (manifest.metrics[dependency].unique_id))
             else:
-                dependency_not_found(node, dependency)
+                raise GraphDependencyNotFoundError(node, dependency)
 
     def link_graph(self, linker: Linker, manifest: Manifest, add_test_edges: bool = False):
         for source in manifest.sources.values():
@@ -439,10 +430,10 @@ class Compiler:
             self.add_test_edges(linker, manifest)
 
     def add_test_edges(self, linker: Linker, manifest: Manifest) -> None:
-        """ This method adds additional edges to the DAG. For a given non-test
+        """This method adds additional edges to the DAG. For a given non-test
         executable node, add an edge from an upstream test to the given node if
         the set of nodes the test depends on is a subset of the upstream nodes
-        for the given node. """
+        for the given node."""
 
         # Given a graph:
         # model1 --> model2 --> model3
@@ -462,25 +453,18 @@ class Compiler:
             # If node is executable (in manifest.nodes) and does _not_
             # represent a test, continue.
             if (
-                node_id in manifest.nodes and
-                manifest.nodes[node_id].resource_type != NodeType.Test
+                node_id in manifest.nodes
+                and manifest.nodes[node_id].resource_type != NodeType.Test
             ):
                 # Get *everything* upstream of the node
-                all_upstream_nodes = nx.traversal.bfs_tree(
-                    linker.graph, node_id, reverse=True
-                )
+                all_upstream_nodes = nx.traversal.bfs_tree(linker.graph, node_id, reverse=True)
                 # Get the set of upstream nodes not including the current node.
-                upstream_nodes = set([
-                    n for n in all_upstream_nodes if n != node_id
-                ])
+                upstream_nodes = set([n for n in all_upstream_nodes if n != node_id])
 
                 # Get all tests that depend on any upstream nodes.
                 upstream_tests = []
                 for upstream_node in upstream_nodes:
-                    upstream_tests += _get_tests_for_node(
-                        manifest,
-                        upstream_node
-                    )
+                    upstream_tests += _get_tests_for_node(manifest, upstream_node)
 
                 for upstream_test in upstream_tests:
                     # Get the set of all nodes that the test depends on
@@ -489,18 +473,13 @@ class Compiler:
                     # relationship tests). Test nodes do not distinguish
                     # between what node the test is "testing" and what
                     # node(s) it depends on.
-                    test_depends_on = set(
-                        manifest.nodes[upstream_test].depends_on_nodes
-                    )
+                    test_depends_on = set(manifest.nodes[upstream_test].depends_on_nodes)
 
                     # If the set of nodes that an upstream test depends on
                     # is a subset of all upstream nodes of the current node,
                     # add an edge from the upstream test to the current node.
-                    if (test_depends_on.issubset(upstream_nodes)):
-                        linker.graph.add_edge(
-                            upstream_test,
-                            node_id
-                        )
+                    if test_depends_on.issubset(upstream_nodes):
+                        linker.graph.add_edge(upstream_test, node_id)
 
     def compile(self, manifest: Manifest, write=True, add_test_edges=False) -> Graph:
         self.initialize()
@@ -512,32 +491,38 @@ class Compiler:
 
         if write:
             self.write_graph_file(linker, manifest)
-        print_compile_stats(stats)
+
+        # Do not print these for ListTask's
+        if not (
+            self.config.args.__class__ == argparse.Namespace
+            and self.config.args.cls == list_task.ListTask
+        ):
+            print_compile_stats(stats)
 
         return Graph(linker.graph)
 
-    # writes the "compiled_sql" into the target/compiled directory
-    def _write_node(self, node: NonSourceCompiledNode) -> ManifestNode:
-        if (not node.extra_ctes_injected or
-                node.resource_type == NodeType.Snapshot):
+    # writes the "compiled_code" into the target/compiled directory
+    def _write_node(self, node: ManifestSQLNode) -> ManifestSQLNode:
+        if not node.extra_ctes_injected or node.resource_type in (
+            NodeType.Snapshot,
+            NodeType.Seed,
+        ):
             return node
-        logger.debug(f'Writing injected SQL for node "{node.unique_id}"')
+        fire_event(WritingInjectedSQLForNode(node_info=get_node_info()))
 
-        if node.compiled_sql:
+        if node.compiled_code:
             node.compiled_path = node.write_node(
-                self.config.target_path,
-                'compiled',
-                node.compiled_sql
+                self.config.target_path, "compiled", node.compiled_code
             )
         return node
 
     def compile_node(
         self,
-        node: ManifestNode,
+        node: ManifestSQLNode,
         manifest: Manifest,
         extra_context: Optional[Dict[str, Any]] = None,
         write: bool = True,
-    ) -> NonSourceCompiledNode:
+    ) -> ManifestSQLNode:
         """This is the main entry point into this code. It's called by
         CompileRunner.compile, GenericRPCRunner.compile, and
         RunTask.get_hook_sql. It calls '_compile_node' to convert
@@ -546,9 +531,7 @@ class Compiler:
         """
         node = self._compile_node(node, manifest, extra_context)
 
-        node, _ = self._recursively_prepend_ctes(
-            node, manifest, extra_context
-        )
+        node, _ = self._recursively_prepend_ctes(node, manifest, extra_context)
         if write:
             self._write_node(node)
         return node

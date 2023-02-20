@@ -5,15 +5,21 @@ from dbt.adapters.base.meta import available
 from dbt.adapters.base.impl import AdapterConfig
 from dbt.adapters.sql import SQLAdapter
 from dbt.adapters.postgres import PostgresConnectionManager
-from dbt.adapters.postgres import PostgresColumn
+from dbt.adapters.postgres.column import PostgresColumn
 from dbt.adapters.postgres import PostgresRelation
 from dbt.dataclass_schema import dbtClassMixin, ValidationError
-import dbt.exceptions
+from dbt.exceptions import (
+    CrossDbReferenceProhibitedError,
+    IndexConfigNotDictError,
+    IndexConfigError,
+    DbtRuntimeError,
+    UnexpectedDbReferenceError,
+)
 import dbt.utils
 
 
 # note that this isn't an adapter macro, so just a single underscore
-GET_RELATIONS_MACRO_NAME = 'postgres_get_relations'
+GET_RELATIONS_MACRO_NAME = "postgres_get_relations"
 
 
 @dataclass
@@ -28,29 +34,21 @@ class PostgresIndexConfig(dbtClassMixin):
         # https://github.com/dbt-labs/dbt-core/issues/1945#issuecomment-576714925
         # for an explanation.
         now = datetime.utcnow().isoformat()
-        inputs = (self.columns +
-                  [relation.render(), str(self.unique), str(self.type), now])
-        string = '_'.join(inputs)
+        inputs = self.columns + [relation.render(), str(self.unique), str(self.type), now]
+        string = "_".join(inputs)
         return dbt.utils.md5(string)
 
     @classmethod
-    def parse(cls, raw_index) -> Optional['PostgresIndexConfig']:
+    def parse(cls, raw_index) -> Optional["PostgresIndexConfig"]:
         if raw_index is None:
             return None
         try:
             cls.validate(raw_index)
             return cls.from_dict(raw_index)
         except ValidationError as exc:
-            msg = dbt.exceptions.validator_error_message(exc)
-            dbt.exceptions.raise_compiler_error(
-                f'Could not parse index config: {msg}'
-            )
+            raise IndexConfigError(exc)
         except TypeError:
-            dbt.exceptions.raise_compiler_error(
-                f'Invalid index config:\n'
-                f'  Got: {raw_index}\n'
-                f'  Expected a dictionary with at minimum a "columns" key'
-            )
+            raise IndexConfigNotDictError(raw_index)
 
 
 @dataclass
@@ -68,7 +66,7 @@ class PostgresAdapter(SQLAdapter):
 
     @classmethod
     def date_function(cls):
-        return 'now()'
+        return "now()"
 
     @available
     def verify_database(self, database):
@@ -76,12 +74,9 @@ class PostgresAdapter(SQLAdapter):
             database = database.strip('"')
         expected = self.config.credentials.database
         if database.lower() != expected.lower():
-            raise dbt.exceptions.NotImplementedException(
-                'Cross-db references not allowed in {} ({} vs {})'
-                .format(self.type(), database, expected)
-            )
+            raise UnexpectedDbReferenceError(self.type(), database, expected)
         # return an empty string on success so macros can call this
-        return ''
+        return ""
 
     @available
     def parse_index(self, raw_index: Any) -> Optional[PostgresIndexConfig]:
@@ -96,14 +91,10 @@ class PostgresAdapter(SQLAdapter):
 
         for (dep_schema, dep_name, refed_schema, refed_name) in table:
             dependent = self.Relation.create(
-                database=database,
-                schema=dep_schema,
-                identifier=dep_name
+                database=database, schema=dep_schema, identifier=dep_name
             )
             referenced = self.Relation.create(
-                database=database,
-                schema=refed_schema,
-                identifier=refed_name
+                database=database, schema=refed_schema, identifier=refed_name
             )
 
             # don't record in cache if this relation isn't in a relevant
@@ -116,12 +107,8 @@ class PostgresAdapter(SQLAdapter):
         schemas = super()._get_catalog_schemas(manifest)
         try:
             return schemas.flatten()
-        except dbt.exceptions.RuntimeException as exc:
-            dbt.exceptions.raise_compiler_error(
-                'Cross-db references not allowed in adapter {}: Got {}'.format(
-                    self.type(), exc.msg
-                )
-            )
+        except DbtRuntimeError as exc:
+            raise CrossDbReferenceProhibitedError(self.type(), exc.msg)
 
     def _link_cached_relations(self, manifest):
         schemas: Set[str] = set()
@@ -132,11 +119,15 @@ class PostgresAdapter(SQLAdapter):
 
         self._link_cached_database_relations(schemas)
 
-    def _relations_cache_for_schemas(self, manifest):
-        super()._relations_cache_for_schemas(manifest)
+    def _relations_cache_for_schemas(self, manifest, cache_schemas=None):
+        super()._relations_cache_for_schemas(manifest, cache_schemas)
         self._link_cached_relations(manifest)
 
-    def timestamp_add_sql(
-        self, add_to: str, number: int = 1, interval: str = 'hour'
-    ) -> str:
+    def timestamp_add_sql(self, add_to: str, number: int = 1, interval: str = "hour") -> str:
         return f"{add_to} + interval '{number} {interval}'"
+
+    def valid_incremental_strategies(self):
+        """The set of standard builtin strategies which this adapter supports out-of-the-box.
+        Not used to validate custom strategies defined by end users.
+        """
+        return ["append", "delete+insert"]

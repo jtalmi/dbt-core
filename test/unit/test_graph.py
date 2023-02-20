@@ -1,4 +1,6 @@
 import os
+
+from argparse import Namespace
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -22,17 +24,13 @@ try:
 except ImportError:
     from Queue import Empty
 
-from dbt.logger import GLOBAL_LOGGER as logger # noqa
-
 from .utils import config_from_parts_or_dicts, generate_name_macros, inject_plugin
 
 
 class GraphTest(unittest.TestCase):
 
     def tearDown(self):
-        self.write_gpickle_patcher.stop()
-        self.file_system_patcher.stop()
-        self.mock_filesystem_constructor.stop()
+        self.mock_filesystem_search.stop()
         self.mock_hook_constructor.stop()
         self.load_state_check.stop()
         self.load_source_file_patcher.stop()
@@ -61,34 +59,23 @@ class GraphTest(unittest.TestCase):
             {n.unique_id: n for n in generate_name_macros('test_models_compile')})
         self.mock_models = []  # used by filesystem_searcher
 
-        # Create gpickle patcher
-        self.write_gpickle_patcher = patch('networkx.write_gpickle')
-        def mock_write_gpickle(graph, outfile):
-            self.graph_result = graph
-        self.mock_write_gpickle = self.write_gpickle_patcher.start()
-        self.mock_write_gpickle.side_effect = mock_write_gpickle
+        # Create file filesystem searcher
+        self.filesystem_search = patch('dbt.parser.read_files.filesystem_search')
 
-        # Create file system patcher and filesystem searcher
-        self.file_system_patcher = patch.object(
-            dbt.parser.search.FilesystemSearcher, '__new__'
-        )
-        self.mock_filesystem_constructor = self.file_system_patcher.start()
-        def filesystem_iter(iter_self):
-            if 'sql' not in iter_self.extension:
+        def mock_filesystem_search(project, relative_dirs, extension, ignore_spec):
+            if 'sql' not in extension:
                 return []
-            if 'models' not in iter_self.relative_dirs:
+            if 'models' not in relative_dirs:
                 return []
             return [model.path for model in self.mock_models]
-        def create_filesystem_searcher(cls, project, relative_dirs, extension):
-            result = MagicMock(project=project, relative_dirs=relative_dirs, extension=extension)
-            result.__iter__.side_effect = lambda: iter(filesystem_iter(result))
-            return result
-        self.mock_filesystem_constructor.side_effect = create_filesystem_searcher
+        self.mock_filesystem_search = self.filesystem_search.start()
+        self.mock_filesystem_search.side_effect = mock_filesystem_search
 
         # Create HookParser patcher
         self.hook_patcher = patch.object(
             dbt.parser.hooks.HookParser, '__new__'
         )
+
         def create_hook_patcher(cls, project, manifest, root_project):
             result = MagicMock(project=project, manifest=manifest, root_project=root_project)
             result.__iter__.side_effect = lambda: iter([])
@@ -99,7 +86,6 @@ class GraphTest(unittest.TestCase):
         # Create the Manifest.state_check patcher
         @patch('dbt.parser.manifest.ManifestLoader.build_manifest_state_check')
         def _mock_state_check(self):
-            config = self.root_project
             all_projects = self.all_projects
             return ManifestStateCheck(
                 project_env_vars_hash=FileHash.from_contents(''),
@@ -115,6 +101,7 @@ class GraphTest(unittest.TestCase):
         # Create the source file patcher
         self.load_source_file_patcher = patch('dbt.parser.read_files.load_source_file')
         self.mock_source_file = self.load_source_file_patcher.start()
+
         def mock_load_source_file(path, parse_file_type, project_name, saved_files):
             for sf in self.mock_models:
                 if sf.path == path:
@@ -134,7 +121,6 @@ class GraphTest(unittest.TestCase):
             )
             return path
 
-
     def get_config(self, extra_cfg=None):
         if extra_cfg is None:
             extra_cfg = {}
@@ -148,7 +134,10 @@ class GraphTest(unittest.TestCase):
         }
         cfg.update(extra_cfg)
 
-        return config_from_parts_or_dicts(project=cfg, profile=self.profile)
+        config = config_from_parts_or_dicts(project=cfg, profile=self.profile)
+        dbt.flags.set_from_args(Namespace(), config)
+        object.__setattr__(dbt.flags.get_flags(), "PARTIAL_PARSE", False)
+        return config
 
     def get_compiler(self, project):
         return dbt.compilation.Compiler(project)
@@ -238,8 +227,6 @@ class GraphTest(unittest.TestCase):
 
         config = self.get_config(cfg)
         manifest = self.load_manifest(config)
-        compiler = self.get_compiler(config)
-        linker = compiler.compile(manifest)
 
         expected_materialization = {
             "model_one": "table",
@@ -314,7 +301,12 @@ class GraphTest(unittest.TestCase):
         })
         manifest.expect.side_effect = lambda n: MagicMock(unique_id=n)
         selector = NodeSelector(graph, manifest)
-        queue = selector.get_graph_queue(parse_difference(None, None))
+        # TODO:  The "eager" string below needs to be replaced with programatic access
+        #  to the default value for the indirect selection parameter in 
+        # dbt.cli.params.indirect_selection
+        #
+        # Doing that is actually a little tricky, so I'm punting it to a new ticket GH #6397
+        queue = selector.get_graph_queue(parse_difference(None, None, "eager"))
 
         for model_id in model_ids:
             self.assertFalse(queue.empty())

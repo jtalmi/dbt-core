@@ -7,10 +7,7 @@ import threading
 from ast import literal_eval
 from contextlib import contextmanager
 from itertools import chain, islice
-from typing import (
-    List, Union, Set, Optional, Dict, Any, Iterator, Type, NoReturn, Tuple,
-    Callable
-)
+from typing import List, Union, Set, Optional, Dict, Any, Iterator, Type, NoReturn, Tuple, Callable
 
 import jinja2
 import jinja2.ext
@@ -20,20 +17,34 @@ import jinja2.parser
 import jinja2.sandbox
 
 from dbt.utils import (
-    get_dbt_macro_name, get_docs_macro_name, get_materialization_macro_name,
-    get_test_macro_name, deep_map_render
+    get_dbt_macro_name,
+    get_docs_macro_name,
+    get_materialization_macro_name,
+    get_test_macro_name,
+    deep_map_render,
 )
 
 from dbt.clients._jinja_blocks import BlockIterator, BlockData, BlockTag
-from dbt.contracts.graph.compiled import CompiledGenericTestNode
-from dbt.contracts.graph.parsed import ParsedGenericTestNode
+from dbt.contracts.graph.nodes import GenericTestNode
+
 from dbt.exceptions import (
-    InternalException, raise_compiler_error, CompilationException,
-    invalid_materialization_argument, MacroReturn, JinjaRenderingException,
-    UndefinedMacroException
+    CaughtMacroError,
+    CaughtMacroErrorWithNodeError,
+    CompilationError,
+    DbtInternalError,
+    MaterializationArgError,
+    JinjaRenderingError,
+    MacroReturn,
+    MaterializtionMacroNotUsedError,
+    NoSupportedLanguagesFoundError,
+    UndefinedCompilationError,
+    UndefinedMacroError,
 )
-from dbt import flags
-from dbt.logger import GLOBAL_LOGGER as logger  # noqa
+from dbt.flags import get_flags
+from dbt.node_types import ModelLanguage
+
+
+SUPPORTED_LANG_ARG = jinja2.nodes.Name("supported_languages", "param")
 
 
 def _linecache_inject(source, write):
@@ -41,27 +52,22 @@ def _linecache_inject(source, write):
         # this is the only reliable way to accomplish this. Obviously, it's
         # really darn noisy and will fill your temporary directory
         tmp_file = tempfile.NamedTemporaryFile(
-            prefix='dbt-macro-compiled-',
-            suffix='.py',
+            prefix="dbt-macro-compiled-",
+            suffix=".py",
             delete=False,
-            mode='w+',
-            encoding='utf-8',
+            mode="w+",
+            encoding="utf-8",
         )
         tmp_file.write(source)
         filename = tmp_file.name
     else:
         # `codecs.encode` actually takes a `bytes` as the first argument if
         # the second argument is 'hex' - mypy does not know this.
-        rnd = codecs.encode(os.urandom(12), 'hex')  # type: ignore
-        filename = rnd.decode('ascii')
+        rnd = codecs.encode(os.urandom(12), "hex")  # type: ignore
+        filename = rnd.decode("ascii")
 
     # put ourselves in the cache
-    cache_entry = (
-        len(source),
-        None,
-        [line + '\n' for line in source.splitlines()],
-        filename
-    )
+    cache_entry = (len(source), None, [line + "\n" for line in source.splitlines()], filename)
     # linecache does in fact have an attribute `cache`, thanks
     linecache.cache[filename] = cache_entry  # type: ignore
     return filename
@@ -74,12 +80,10 @@ class MacroFuzzParser(jinja2.parser.Parser):
         # modified to fuzz macros defined in the same file. this way
         # dbt can understand the stack of macros being called.
         #  - @cmcarthur
-        node.name = get_dbt_macro_name(
-            self.parse_assign_target(name_only=True).name)
+        node.name = get_dbt_macro_name(self.parse_assign_target(name_only=True).name)
 
         self.parse_signature(node)
-        node.body = self.parse_statements(('name:endmacro',),
-                                          drop_needle=True)
+        node.body = self.parse_statements(("name:endmacro",), drop_needle=True)
         return node
 
 
@@ -95,8 +99,9 @@ class MacroFuzzEnvironment(jinja2.sandbox.SandboxedEnvironment):
         If the value is 'write', also write the files to disk.
         WARNING: This can write a ton of data if you aren't careful.
         """
-        if filename == '<template>' and flags.MACRO_DEBUGGING:
-            write = flags.MACRO_DEBUGGING == 'write'
+        macro_debugging = get_flags().MACRO_DEBUGGING
+        if filename == "<template>" and macro_debugging:
+            write = macro_debugging == "write"
             filename = _linecache_inject(source, write)
 
         return super()._compile(source, filename)  # type: ignore
@@ -107,7 +112,7 @@ class NativeSandboxEnvironment(MacroFuzzEnvironment):
 
 
 class TextMarker(str):
-    """A special native-env marker that indicates that a value is text and is
+    """A special native-env marker that indicates a value is text and is
     not to be evaluated. Use this to prevent your numbery-strings from becoming
     numbers!
     """
@@ -139,7 +144,7 @@ def quoted_native_concat(nodes):
     head = list(islice(nodes, 2))
 
     if not head:
-        return ''
+        return ""
 
     if len(head) == 1:
         raw = head[0]
@@ -157,19 +162,15 @@ def quoted_native_concat(nodes):
     except (ValueError, SyntaxError, MemoryError):
         result = raw
     if isinstance(raw, BoolMarker) and not isinstance(result, bool):
-        raise JinjaRenderingException(
-            f"Could not convert value '{raw!s}' into type 'bool'"
-        )
+        raise JinjaRenderingError(f"Could not convert value '{raw!s}' into type 'bool'")
     if isinstance(raw, NumberMarker) and not _is_number(result):
-        raise JinjaRenderingException(
-            f"Could not convert value '{raw!s}' into type 'number'"
-        )
+        raise JinjaRenderingError(f"Could not convert value '{raw!s}' into type 'number'")
 
     return result
 
 
 class NativeSandboxTemplate(jinja2.nativetypes.NativeTemplate):  # mypy: ignore
-    environment_class = NativeSandboxEnvironment
+    environment_class = NativeSandboxEnvironment  # type: ignore
 
     def render(self, *args, **kwargs):
         """Render the template to produce a native Python type. If the
@@ -181,9 +182,7 @@ class NativeSandboxTemplate(jinja2.nativetypes.NativeTemplate):  # mypy: ignore
         vars = dict(*args, **kwargs)
 
         try:
-            return quoted_native_concat(
-                self.root_render_func(self.new_context(vars))
-            )
+            return quoted_native_concat(self.root_render_func(self.new_context(vars)))
         except Exception:
             return self.environment.handle_exception()
 
@@ -222,10 +221,10 @@ class BaseMacroGenerator:
         self.context: Optional[Dict[str, Any]] = context
 
     def get_template(self):
-        raise NotImplementedError('get_template not implemented!')
+        raise NotImplementedError("get_template not implemented!")
 
     def get_name(self) -> str:
-        raise NotImplementedError('get_name not implemented!')
+        raise NotImplementedError("get_name not implemented!")
 
     def get_macro(self):
         name = self.get_name()
@@ -243,14 +242,12 @@ class BaseMacroGenerator:
         try:
             yield
         except (TypeError, jinja2.exceptions.TemplateRuntimeError) as e:
-            raise_compiler_error(str(e))
+            raise CaughtMacroError(e)
 
     def call_macro(self, *args, **kwargs):
         # called from __call__ methods
         if self.context is None:
-            raise InternalException(
-                'Context is still None in call_macro!'
-            )
+            raise DbtInternalError("Context is still None in call_macro!")
         assert self.context is not None
 
         macro = self.get_macro()
@@ -277,7 +274,7 @@ class MacroStack(threading.local):
     def pop(self, name):
         got = self.call_stack.pop()
         if got != name:
-            raise InternalException(f'popped {got}, expected {name}')
+            raise DbtInternalError(f"popped {got}, expected {name}")
 
 
 class MacroGenerator(BaseMacroGenerator):
@@ -286,7 +283,7 @@ class MacroGenerator(BaseMacroGenerator):
         macro,
         context: Optional[Dict[str, Any]] = None,
         node: Optional[Any] = None,
-        stack: Optional[MacroStack] = None
+        stack: Optional[MacroStack] = None,
     ) -> None:
         super().__init__(context)
         self.macro = macro
@@ -304,8 +301,8 @@ class MacroGenerator(BaseMacroGenerator):
         try:
             yield
         except (TypeError, jinja2.exceptions.TemplateRuntimeError) as e:
-            raise_compiler_error(str(e), self.macro)
-        except CompilationException as e:
+            raise CaughtMacroErrorWithNodeError(exc=e, node=self.macro)
+        except CompilationError as e:
             e.stack.append(self.macro)
             raise e
 
@@ -313,13 +310,13 @@ class MacroGenerator(BaseMacroGenerator):
     @contextmanager
     def track_call(self):
         # This is only called from __call__
-        if self.stack is None or self.node is None:
+        if self.stack is None:
             yield
         else:
             unique_id = self.macro.unique_id
             depth = self.stack.depth
-            # only mark depth=0 as a dependency
-            if depth == 0:
+            # only mark depth=0 as a dependency, when creating this dependency we don't pass in stack
+            if depth == 0 and self.node:
                 self.node.depends_on.add_macro(unique_id)
             self.stack.push(unique_id)
             try:
@@ -334,9 +331,7 @@ class MacroGenerator(BaseMacroGenerator):
 
 
 class QueryStringGenerator(BaseMacroGenerator):
-    def __init__(
-        self, template_str: str, context: Dict[str, Any]
-    ) -> None:
+    def __init__(self, template_str: str, context: Dict[str, Any]) -> None:
         super().__init__(context)
         self.template_str: str = template_str
         env = get_environment()
@@ -346,7 +341,7 @@ class QueryStringGenerator(BaseMacroGenerator):
         )
 
     def get_name(self) -> str:
-        return 'query_comment_macro'
+        return "query_comment_macro"
 
     def get_template(self):
         """Don't use the template cache, we don't have a node"""
@@ -357,45 +352,50 @@ class QueryStringGenerator(BaseMacroGenerator):
 
 
 class MaterializationExtension(jinja2.ext.Extension):
-    tags = ['materialization']
+    tags = ["materialization"]
 
     def parse(self, parser):
         node = jinja2.nodes.Macro(lineno=next(parser.stream).lineno)
-        materialization_name = \
-            parser.parse_assign_target(name_only=True).name
+        materialization_name = parser.parse_assign_target(name_only=True).name
 
-        adapter_name = 'default'
+        adapter_name = "default"
         node.args = []
         node.defaults = []
 
-        while parser.stream.skip_if('comma'):
+        while parser.stream.skip_if("comma"):
             target = parser.parse_assign_target(name_only=True)
 
-            if target.name == 'default':
+            if target.name == "default":
                 pass
 
-            elif target.name == 'adapter':
-                parser.stream.expect('assign')
+            elif target.name == "adapter":
+                parser.stream.expect("assign")
                 value = parser.parse_expression()
                 adapter_name = value.value
 
+            elif target.name == "supported_languages":
+                target.set_ctx("param")
+                node.args.append(target)
+                parser.stream.expect("assign")
+                languages = parser.parse_expression()
+                node.defaults.append(languages)
+
             else:
-                invalid_materialization_argument(
-                    materialization_name, target.name
-                )
+                raise MaterializationArgError(materialization_name, target.name)
 
-        node.name = get_materialization_macro_name(
-            materialization_name, adapter_name
-        )
+        if SUPPORTED_LANG_ARG not in node.args:
+            node.args.append(SUPPORTED_LANG_ARG)
+            node.defaults.append(jinja2.nodes.List([jinja2.nodes.Const("sql")]))
 
-        node.body = parser.parse_statements(('name:endmaterialization',),
-                                            drop_needle=True)
+        node.name = get_materialization_macro_name(materialization_name, adapter_name)
+
+        node.body = parser.parse_statements(("name:endmaterialization",), drop_needle=True)
 
         return node
 
 
 class DocumentationExtension(jinja2.ext.Extension):
-    tags = ['docs']
+    tags = ["docs"]
 
     def parse(self, parser):
         node = jinja2.nodes.Macro(lineno=next(parser.stream).lineno)
@@ -404,13 +404,12 @@ class DocumentationExtension(jinja2.ext.Extension):
         node.args = []
         node.defaults = []
         node.name = get_docs_macro_name(docs_name)
-        node.body = parser.parse_statements(('name:enddocs',),
-                                            drop_needle=True)
+        node.body = parser.parse_statements(("name:enddocs",), drop_needle=True)
         return node
 
 
 class TestExtension(jinja2.ext.Extension):
-    tags = ['test']
+    tags = ["test"]
 
     def parse(self, parser):
         node = jinja2.nodes.Macro(lineno=next(parser.stream).lineno)
@@ -418,13 +417,12 @@ class TestExtension(jinja2.ext.Extension):
 
         parser.parse_signature(node)
         node.name = get_test_macro_name(test_name)
-        node.body = parser.parse_statements(('name:endtest',),
-                                            drop_needle=True)
+        node.body = parser.parse_statements(("name:endtest",), drop_needle=True)
         return node
 
 
 def _is_dunder_name(name):
-    return name.startswith('__') and name.endswith('__')
+    return name.startswith("__") and name.endswith("__")
 
 
 def create_undefined(node=None):
@@ -445,10 +443,9 @@ def create_undefined(node=None):
             return self
 
         def __getattr__(self, name):
-            if name == 'name' or _is_dunder_name(name):
+            if name == "name" or _is_dunder_name(name):
                 raise AttributeError(
-                    "'{}' object has no attribute '{}'"
-                    .format(type(self).__name__, name)
+                    "'{}' object has no attribute '{}'".format(type(self).__name__, name)
                 )
 
             self.name = name
@@ -459,24 +456,24 @@ def create_undefined(node=None):
             return self
 
         def __reduce__(self):
-            raise_compiler_error(f'{self.name} is undefined', node=node)
+            raise UndefinedCompilationError(name=self.name, node=node)
 
     return Undefined
 
 
 NATIVE_FILTERS: Dict[str, Callable[[Any], Any]] = {
-    'as_text': TextMarker,
-    'as_bool': BoolMarker,
-    'as_native': NativeMarker,
-    'as_number': NumberMarker,
+    "as_text": TextMarker,
+    "as_bool": BoolMarker,
+    "as_native": NativeMarker,
+    "as_number": NumberMarker,
 }
 
 
 TEXT_FILTERS: Dict[str, Callable[[Any], Any]] = {
-    'as_text': lambda x: x,
-    'as_bool': lambda x: x,
-    'as_native': lambda x: x,
-    'as_number': lambda x: x,
+    "as_text": lambda x: x,
+    "as_bool": lambda x: x,
+    "as_native": lambda x: x,
+    "as_number": lambda x: x,
 }
 
 
@@ -486,15 +483,15 @@ def get_environment(
     native: bool = False,
 ) -> jinja2.Environment:
     args: Dict[str, List[Union[str, Type[jinja2.ext.Extension]]]] = {
-        'extensions': ['jinja2.ext.do']
+        "extensions": ["jinja2.ext.do"]
     }
 
     if capture_macros:
-        args['undefined'] = create_undefined(node)
+        args["undefined"] = create_undefined(node)
 
-    args['extensions'].append(MaterializationExtension)
-    args['extensions'].append(DocumentationExtension)
-    args['extensions'].append(TestExtension)
+    args["extensions"].append(MaterializationExtension)
+    args["extensions"].append(DocumentationExtension)
+    args["extensions"].append(TestExtension)
 
     env_cls: Type[jinja2.Environment]
     text_filter: Type
@@ -517,10 +514,10 @@ def catch_jinja(node=None) -> Iterator[None]:
         yield
     except jinja2.exceptions.TemplateSyntaxError as e:
         e.translated = False
-        raise CompilationException(str(e), node) from e
+        raise CompilationError(str(e), node) from e
     except jinja2.exceptions.UndefinedError as e:
-        raise UndefinedMacroException(str(e), node) from e
-    except CompilationException as exc:
+        raise UndefinedMacroError(str(e), node) from e
+    except CompilationError as exc:
         exc.add_node(node)
         raise
 
@@ -557,8 +554,8 @@ def _requote_result(raw_value: str, rendered: str) -> str:
     elif single_quoted:
         quote_char = "'"
     else:
-        quote_char = ''
-    return f'{quote_char}{rendered}{quote_char}'
+        quote_char = ""
+    return f"{quote_char}{rendered}{quote_char}"
 
 
 # performance note: Local benmcharking (so take it with a big grain of salt!)
@@ -566,7 +563,7 @@ def _requote_result(raw_value: str, rendered: str) -> str:
 # checking two separate patterns, but the standard deviation is smaller with
 # one pattern. The time difference between the two was ~2 std deviations, which
 # is small enough that I've just chosen the more readable option.
-_HAS_RENDER_CHARS_PAT = re.compile(r'({[{%#]|[#}%]})')
+_HAS_RENDER_CHARS_PAT = re.compile(r"({[{%#]|[#}%]})")
 
 
 def get_rendered(
@@ -582,11 +579,7 @@ def get_rendered(
     # If this is desirable in the native env as well, we could handle the
     # native=True case by passing the input string to ast.literal_eval, like
     # the native renderer does.
-    if (
-        not native and
-        isinstance(string, str) and
-        _HAS_RENDER_CHARS_PAT.search(string) is None
-    ):
+    if not native and isinstance(string, str) and _HAS_RENDER_CHARS_PAT.search(string) is None:
         return string
     template = get_template(
         string,
@@ -607,7 +600,7 @@ def extract_toplevel_blocks(
     allowed_blocks: Optional[Set[str]] = None,
     collect_raw_data: bool = True,
 ) -> List[Union[BlockData, BlockTag]]:
-    """Extract the top level blocks with matching block types from a jinja
+    """Extract the top-level blocks with matching block types from a jinja
     file, with some special handling for block nesting.
 
     :param data: The data to extract blocks from.
@@ -622,42 +615,36 @@ def extract_toplevel_blocks(
         `collect_raw_data` is `True`) `BlockData` objects.
     """
     return BlockIterator(data).lex_for_blocks(
-        allowed_blocks=allowed_blocks,
-        collect_raw_data=collect_raw_data
+        allowed_blocks=allowed_blocks, collect_raw_data=collect_raw_data
     )
 
 
-GENERIC_TEST_KWARGS_NAME = '_dbt_generic_test_kwargs'
+GENERIC_TEST_KWARGS_NAME = "_dbt_generic_test_kwargs"
 
 
 def add_rendered_test_kwargs(
     context: Dict[str, Any],
-    node: Union[ParsedGenericTestNode, CompiledGenericTestNode],
+    node: GenericTestNode,
     capture_macros: bool = False,
 ) -> None:
     """Render each of the test kwargs in the given context using the native
     renderer, then insert that value into the given context as the special test
     keyword arguments member.
     """
-    looks_like_func = r'^\s*(env_var|ref|var|source|doc)\s*\(.+\)\s*$'
+    looks_like_func = r"^\s*(env_var|ref|var|source|doc)\s*\(.+\)\s*$"
 
-    def _convert_function(
-        value: Any, keypath: Tuple[Union[str, int], ...]
-    ) -> Any:
+    def _convert_function(value: Any, keypath: Tuple[Union[str, int], ...]) -> Any:
         if isinstance(value, str):
-            if keypath == ('column_name',):
+            if keypath == ("column_name",):
                 # special case: Don't render column names as native, make them
                 # be strings
                 return value
 
             if re.match(looks_like_func, value) is not None:
                 # curly braces to make rendering happy
-                value = f'{{{{ {value} }}}}'
+                value = f"{{{{ {value} }}}}"
 
-            value = get_rendered(
-                value, context, node, capture_macros=capture_macros,
-                native=True
-            )
+            value = get_rendered(value, context, node, capture_macros=capture_macros, native=True)
 
         return value
 
@@ -665,3 +652,21 @@ def add_rendered_test_kwargs(
     # when the test node was created in _parse_generic_test.
     kwargs = deep_map_render(_convert_function, node.test_metadata.kwargs)
     context[GENERIC_TEST_KWARGS_NAME] = kwargs
+
+
+def get_supported_languages(node: jinja2.nodes.Macro) -> List[ModelLanguage]:
+    if "materialization" not in node.name:
+        raise MaterializtionMacroNotUsedError(node=node)
+
+    no_kwargs = not node.defaults
+    no_langs_found = SUPPORTED_LANG_ARG not in node.args
+
+    if no_kwargs or no_langs_found:
+        raise NoSupportedLanguagesFoundError(node=node)
+
+    lang_idx = node.args.index(SUPPORTED_LANG_ARG)
+    # indexing defaults from the end
+    # since supported_languages is a kwarg, and kwargs are at always after args
+    return [
+        ModelLanguage[item.value] for item in node.defaults[-(len(node.args) - lang_idx)].items
+    ]

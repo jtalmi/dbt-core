@@ -1,12 +1,14 @@
 from typing import Dict, Any, Tuple, Optional, Union, Callable
+import re
+import os
 
 from dbt.clients.jinja import get_rendered, catch_jinja
+from dbt.constants import SECRET_ENV_PREFIX
 from dbt.context.target import TargetContext
+from dbt.context.secret import SecretContext, SECRET_PLACEHOLDER
 from dbt.context.base import BaseContext
 from dbt.contracts.connection import HasCredentials
-from dbt.exceptions import (
-    DbtProjectError, CompilationException, RecursionException
-)
+from dbt.exceptions import DbtProjectError, CompilationError, RecursionError
 from dbt.utils import deep_map_render
 
 
@@ -19,7 +21,7 @@ class BaseRenderer:
 
     @property
     def name(self):
-        return 'Rendering'
+        return "Rendering"
 
     def should_render_keypath(self, keypath: Keypath) -> bool:
         return True
@@ -30,9 +32,7 @@ class BaseRenderer:
 
         return self.render_value(value, keypath)
 
-    def render_value(
-        self, value: Any, keypath: Optional[Keypath] = None
-    ) -> Any:
+    def render_value(self, value: Any, keypath: Optional[Keypath] = None) -> Any:
         # keypath is ignored.
         # if it wasn't read as a string, ignore it
         if not isinstance(value, str):
@@ -40,19 +40,16 @@ class BaseRenderer:
         try:
             with catch_jinja():
                 return get_rendered(value, self.context, native=True)
-        except CompilationException as exc:
-            msg = f'Could not render {value}: {exc.msg}'
-            raise CompilationException(msg) from exc
+        except CompilationError as exc:
+            msg = f"Could not render {value}: {exc.msg}"
+            raise CompilationError(msg) from exc
 
-    def render_data(
-        self, data: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def render_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         try:
             return deep_map_render(self.render_entry, data)
-        except RecursionException:
+        except RecursionError:
             raise DbtProjectError(
-                f'Cycle detected: {self.name} input has a reference to itself',
-                project=data
+                f"Cycle detected: {self.name} input has a reference to itself", project=data
             )
 
 
@@ -79,15 +76,15 @@ class ProjectPostprocessor(Dict[Keypath, Callable[[Any], Any]]):
     def __init__(self):
         super().__init__()
 
-        self[('on-run-start',)] = _list_if_none_or_string
-        self[('on-run-end',)] = _list_if_none_or_string
+        self[("on-run-start",)] = _list_if_none_or_string
+        self[("on-run-end",)] = _list_if_none_or_string
 
-        for k in ('models', 'seeds', 'snapshots'):
+        for k in ("models", "seeds", "snapshots"):
             self[(k,)] = _dict_if_none
-            self[(k, 'vars')] = _dict_if_none
-            self[(k, 'pre-hook')] = _list_if_none_or_string
-            self[(k, 'post-hook')] = _list_if_none_or_string
-        self[('seeds', 'column_types')] = _dict_if_none
+            self[(k, "vars")] = _dict_if_none
+            self[(k, "pre-hook")] = _list_if_none_or_string
+            self[(k, "post-hook")] = _list_if_none_or_string
+        self[("seeds", "column_types")] = _dict_if_none
 
     def postprocess(self, value: Any, key: Keypath) -> Any:
         if key in self:
@@ -101,8 +98,7 @@ class DbtProjectYamlRenderer(BaseRenderer):
     _KEYPATH_HANDLERS = ProjectPostprocessor()
 
     def __init__(
-        self, profile: Optional[HasCredentials] = None,
-        cli_vars: Optional[Dict[str, Any]] = None
+        self, profile: Optional[HasCredentials] = None, cli_vars: Optional[Dict[str, Any]] = None
     ) -> None:
         # Generate contexts here because we want to save the context
         # object in order to retrieve the env_vars. This is almost always
@@ -111,7 +107,7 @@ class DbtProjectYamlRenderer(BaseRenderer):
         if cli_vars is None:
             cli_vars = {}
         if profile:
-            self.ctx_obj = TargetContext(profile, cli_vars)
+            self.ctx_obj = TargetContext(profile.to_target_dict(), cli_vars)
         else:
             self.ctx_obj = BaseContext(cli_vars)  # type:ignore
         context = self.ctx_obj.to_dict()
@@ -119,13 +115,11 @@ class DbtProjectYamlRenderer(BaseRenderer):
 
     @property
     def name(self):
-        'Project config'
+        "Project config"
 
+    # Uses SecretRenderer
     def get_package_renderer(self) -> BaseRenderer:
-        return PackageRenderer(self.context)
-
-    def get_selector_renderer(self) -> BaseRenderer:
-        return SelectorRenderer(self.context)
+        return PackageRenderer(self.ctx_obj.cli_vars)
 
     def render_project(
         self,
@@ -134,7 +128,7 @@ class DbtProjectYamlRenderer(BaseRenderer):
     ) -> Dict[str, Any]:
         """Render the project and insert the project root after rendering."""
         rendered_project = self.render_data(project)
-        rendered_project['project-root'] = project_root
+        rendered_project["project-root"] = project_root
         return rendered_project
 
     def render_packages(self, packages: Dict[str, Any]):
@@ -143,8 +137,7 @@ class DbtProjectYamlRenderer(BaseRenderer):
         return package_renderer.render_data(packages)
 
     def render_selectors(self, selectors: Dict[str, Any]):
-        selector_renderer = self.get_selector_renderer()
-        return selector_renderer.render_data(selectors)
+        return self.render_data(selectors)
 
     def render_entry(self, value: Any, keypath: Keypath) -> Any:
         result = super().render_entry(value, keypath)
@@ -156,50 +149,65 @@ class DbtProjectYamlRenderer(BaseRenderer):
 
         first = keypath[0]
         # run hooks are not rendered
-        if first in {'on-run-start', 'on-run-end', 'query-comment'}:
+        if first in {"on-run-start", "on-run-end", "query-comment"}:
             return False
 
         # don't render vars blocks until runtime
-        if first == 'vars':
+        if first == "vars":
             return False
 
-        if first in {'seeds', 'models', 'snapshots', 'tests'}:
-            keypath_parts = {
-                (k.lstrip('+ ') if isinstance(k, str) else k)
-                for k in keypath
-            }
+        if first in {"seeds", "models", "snapshots", "tests"}:
+            keypath_parts = {(k.lstrip("+ ") if isinstance(k, str) else k) for k in keypath}
             # model-level hooks
-            if 'pre-hook' in keypath_parts or 'post-hook' in keypath_parts:
+            late_rendered_hooks = {"pre-hook", "post-hook", "pre_hook", "post_hook"}
+            if keypath_parts.intersection(late_rendered_hooks):
                 return False
 
         return True
 
 
-class ProfileRenderer(BaseRenderer):
-
-    def __init__(
-        self, cli_vars: Optional[Dict[str, Any]] = None
-    ) -> None:
+class SecretRenderer(BaseRenderer):
+    def __init__(self, cli_vars: Dict[str, Any] = {}) -> None:
         # Generate contexts here because we want to save the context
         # object in order to retrieve the env_vars.
-        if cli_vars is None:
-            cli_vars = {}
-        self.ctx_obj = BaseContext(cli_vars)
+        self.ctx_obj = SecretContext(cli_vars)
         context = self.ctx_obj.to_dict()
         super().__init__(context)
 
     @property
     def name(self):
-        'Profile'
+        return "Secret"
+
+    def render_value(self, value: Any, keypath: Optional[Keypath] = None) -> Any:
+        # First, standard Jinja rendering, with special handling for 'secret' environment variables
+        # "{{ env_var('DBT_SECRET_ENV_VAR') }}" -> "$$$DBT_SECRET_START$$$DBT_SECRET_ENV_{VARIABLE_NAME}$$$DBT_SECRET_END$$$"
+        # This prevents Jinja manipulation of secrets via macros/filters that might leak partial/modified values in logs
+        rendered = super().render_value(value, keypath)
+        # Now, detect instances of the placeholder value ($$$DBT_SECRET_START...DBT_SECRET_END$$$)
+        # and replace them with the actual secret value
+        if SECRET_ENV_PREFIX in str(rendered):
+            search_group = f"({SECRET_ENV_PREFIX}(.*))"
+            pattern = SECRET_PLACEHOLDER.format(search_group).replace("$", r"\$")
+            m = re.search(
+                pattern,
+                rendered,
+            )
+            if m:
+                found = m.group(1)
+                value = os.environ[found]
+                replace_this = SECRET_PLACEHOLDER.format(found)
+                return rendered.replace(replace_this, value)
+        else:
+            return rendered
 
 
-class PackageRenderer(BaseRenderer):
+class ProfileRenderer(SecretRenderer):
     @property
     def name(self):
-        return 'Packages config'
+        return "Profile"
 
 
-class SelectorRenderer(BaseRenderer):
+class PackageRenderer(SecretRenderer):
     @property
     def name(self):
-        return 'Selector config'
+        return "Packages config"

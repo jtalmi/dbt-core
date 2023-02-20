@@ -4,25 +4,25 @@ import jinja2
 
 from dbt.clients import jinja
 from dbt.contracts.graph.unparsed import UnparsedMacro
-from dbt.contracts.graph.parsed import ParsedMacro
+from dbt.contracts.graph.nodes import Macro
 from dbt.contracts.files import FilePath, SourceFile
-from dbt.exceptions import CompilationException
-from dbt.logger import GLOBAL_LOGGER as logger
+from dbt.exceptions import ParsingError
+from dbt.events.functions import fire_event
+from dbt.events.types import MacroFileParse
 from dbt.node_types import NodeType
 from dbt.parser.base import BaseParser
-from dbt.parser.search import FileBlock, FilesystemSearcher
+from dbt.parser.search import FileBlock, filesystem_search
 from dbt.utils import MACRO_PREFIX
+from dbt.flags import get_flags
 
 
-class MacroParser(BaseParser[ParsedMacro]):
+class MacroParser(BaseParser[Macro]):
     # This is only used when creating a MacroManifest separate
     # from the normal parsing flow.
     def get_paths(self) -> List[FilePath]:
-        return list(FilesystemSearcher(
-            project=self.project,
-            relative_dirs=self.project.macro_paths,
-            extension='.sql',
-        ))
+        return filesystem_search(
+            project=self.project, relative_dirs=self.project.macro_paths, extension=".sql"
+        )
 
     @property
     def resource_type(self) -> NodeType:
@@ -32,43 +32,38 @@ class MacroParser(BaseParser[ParsedMacro]):
     def get_compiled_path(cls, block: FileBlock):
         return block.path.relative_path
 
-    def parse_macro(
-        self, block: jinja.BlockTag, base_node: UnparsedMacro, name: str
-    ) -> ParsedMacro:
+    def parse_macro(self, block: jinja.BlockTag, base_node: UnparsedMacro, name: str) -> Macro:
         unique_id = self.generate_unique_id(name)
 
-        return ParsedMacro(
+        return Macro(
             path=base_node.path,
             macro_sql=block.full_block,
             original_file_path=base_node.original_file_path,
             package_name=base_node.package_name,
-            root_path=base_node.root_path,
             resource_type=base_node.resource_type,
             name=name,
             unique_id=unique_id,
         )
 
-    def parse_unparsed_macros(
-        self, base_node: UnparsedMacro
-    ) -> Iterable[ParsedMacro]:
+    def parse_unparsed_macros(self, base_node: UnparsedMacro) -> Iterable[Macro]:
         try:
             blocks: List[jinja.BlockTag] = [
-                t for t in
-                jinja.extract_toplevel_blocks(
-                    base_node.raw_sql,
-                    allowed_blocks={'macro', 'materialization', 'test'},
+                t
+                for t in jinja.extract_toplevel_blocks(
+                    base_node.raw_code,
+                    allowed_blocks={"macro", "materialization", "test"},
                     collect_raw_data=False,
                 )
                 if isinstance(t, jinja.BlockTag)
             ]
-        except CompilationException as exc:
+        except ParsingError as exc:
             exc.add_node(base_node)
             raise
 
         for block in blocks:
             try:
                 ast = jinja.parse(block.full_block)
-            except CompilationException as e:
+            except ParsingError as e:
                 e.add_node(base_node)
                 raise
 
@@ -77,18 +72,20 @@ class MacroParser(BaseParser[ParsedMacro]):
             if len(macro_nodes) != 1:
                 # things have gone disastrously wrong, we thought we only
                 # parsed one block!
-                raise CompilationException(
-                    f'Found multiple macros in {block.full_block}, expected 1',
-                    node=base_node
+                raise ParsingError(
+                    f"Found multiple macros in {block.full_block}, expected 1", node=base_node
                 )
 
-            macro_name = macro_nodes[0].name
+            macro = macro_nodes[0]
 
-            if not macro_name.startswith(MACRO_PREFIX):
+            if not macro.name.startswith(MACRO_PREFIX):
                 continue
 
-            name: str = macro_name.replace(MACRO_PREFIX, '')
+            name: str = macro.name.replace(MACRO_PREFIX, "")
             node = self.parse_macro(block, base_node, name)
+            # get supported_languages for materialization macro
+            if "materialization" in name:
+                node.supported_languages = jinja.get_supported_languages(macro)
             yield node
 
     def parse_file(self, block: FileBlock):
@@ -96,16 +93,17 @@ class MacroParser(BaseParser[ParsedMacro]):
         source_file = block.file
         assert isinstance(source_file.contents, str)
         original_file_path = source_file.path.original_file_path
-        logger.debug("Parsing {}".format(original_file_path))
+        if get_flags().MACRO_DEBUGGING:
+            fire_event(MacroFileParse(path=original_file_path))
 
         # this is really only used for error messages
         base_node = UnparsedMacro(
             path=original_file_path,
             original_file_path=original_file_path,
             package_name=self.project.project_name,
-            raw_sql=source_file.contents,
-            root_path=self.project.project_root,
+            raw_code=source_file.contents,
             resource_type=NodeType.Macro,
+            language="sql",
         )
 
         for node in self.parse_unparsed_macros(base_node):

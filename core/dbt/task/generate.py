@@ -8,39 +8,50 @@ from dbt.dataclass_schema import ValidationError
 from .compile import CompileTask
 
 from dbt.adapters.factory import get_adapter
-from dbt.contracts.graph.compiled import CompileResultNode
+from dbt.contracts.graph.nodes import ResultNode
 from dbt.contracts.graph.manifest import Manifest
 from dbt.contracts.results import (
-    NodeStatus, TableMetadata, CatalogTable, CatalogResults, PrimitiveDict,
-    CatalogKey, StatsItem, StatsDict, ColumnMetadata, CatalogArtifact
+    NodeStatus,
+    TableMetadata,
+    CatalogTable,
+    CatalogResults,
+    PrimitiveDict,
+    CatalogKey,
+    StatsItem,
+    StatsDict,
+    ColumnMetadata,
+    CatalogArtifact,
 )
-from dbt.exceptions import InternalException
+from dbt.exceptions import DbtInternalError, AmbiguousCatalogMatchError
 from dbt.include.global_project import DOCS_INDEX_FILE_PATH
-from dbt.logger import GLOBAL_LOGGER as logger, print_timestamped_line
-from dbt.parser.manifest import ManifestLoader
+from dbt.events.functions import fire_event
+from dbt.events.types import (
+    WriteCatalogFailure,
+    CatalogWritten,
+    CannotGenerateDocs,
+    BuildingCatalog,
+)
+from dbt.parser.manifest import write_manifest
 import dbt.utils
 import dbt.compilation
 import dbt.exceptions
 
 
-CATALOG_FILENAME = 'catalog.json'
+CATALOG_FILENAME = "catalog.json"
 
 
 def get_stripped_prefix(source: Dict[str, Any], prefix: str) -> Dict[str, Any]:
-    """Go through source, extracting every key/value pair where the key starts
+    """Go through the source, extracting every key/value pair where the key starts
     with the given prefix.
     """
     cut = len(prefix)
-    return {
-        k[cut:]: v for k, v in source.items()
-        if k.startswith(prefix)
-    }
+    return {k[cut:]: v for k, v in source.items() if k.startswith(prefix)}
 
 
 def build_catalog_table(data) -> CatalogTable:
     # build the new table's metadata + stats
-    metadata = TableMetadata.from_dict(get_stripped_prefix(data, 'table_'))
-    stats = format_stats(get_stripped_prefix(data, 'stats:'))
+    metadata = TableMetadata.from_dict(get_stripped_prefix(data, "table_"))
+    stats = format_stats(get_stripped_prefix(data, "stats:"))
 
     return CatalogTable(
         metadata=metadata,
@@ -57,7 +68,7 @@ class Catalog(Dict[CatalogKey, CatalogTable]):
             self.add_column(col)
 
     def get_table(self, data: PrimitiveDict) -> CatalogTable:
-        database = data.get('table_database')
+        database = data.get("table_database")
         if database is None:
             dkey: Optional[str] = None
         else:
@@ -66,13 +77,12 @@ class Catalog(Dict[CatalogKey, CatalogTable]):
         try:
             key = CatalogKey(
                 dkey,
-                str(data['table_schema']),
-                str(data['table_name']),
+                str(data["table_schema"]),
+                str(data["table_name"]),
             )
         except KeyError as exc:
-            raise dbt.exceptions.CompilationException(
-                'Catalog information missing required key {} (got {})'
-                .format(exc, data)
+            raise dbt.exceptions.CompilationError(
+                "Catalog information missing required key {} (got {})".format(exc, data)
             )
         table: CatalogTable
         if key in self:
@@ -84,10 +94,10 @@ class Catalog(Dict[CatalogKey, CatalogTable]):
 
     def add_column(self, data: PrimitiveDict):
         table = self.get_table(data)
-        column_data = get_stripped_prefix(data, 'column_')
+        column_data = get_stripped_prefix(data, "column_")
         # the index should really never be that big so it's ok to end up
         # serializing this to JSON (2^53 is the max safe value there)
-        column_data['index'] = int(column_data['index'])
+        column_data["index"] = int(column_data["index"])
 
         column = ColumnMetadata.from_dict(column_data)
         table.columns[column.name] = column
@@ -109,7 +119,7 @@ class Catalog(Dict[CatalogKey, CatalogTable]):
             unique_ids = source_map.get(table.key(), set())
             for unique_id in unique_ids:
                 if unique_id in sources:
-                    dbt.exceptions.raise_ambiguous_catalog_match(
+                    raise AmbiguousCatalogMatchError(
                         unique_id,
                         sources[unique_id].to_dict(omit_none=True),
                         table.to_dict(omit_none=True),
@@ -139,11 +149,11 @@ def format_stats(stats: PrimitiveDict) -> StatsDict:
     """
     stats_collector: StatsDict = {}
 
-    base_keys = {k.split(':')[0] for k in stats}
+    base_keys = {k.split(":")[0] for k in stats}
     for key in base_keys:
-        dct: PrimitiveDict = {'id': key}
-        for subkey in ('label', 'value', 'description', 'include'):
-            dct[subkey] = stats['{}:{}'.format(key, subkey)]
+        dct: PrimitiveDict = {"id": key}
+        for subkey in ("label", "value", "description", "include"):
+            dct[subkey] = stats["{}:{}".format(key, subkey)]
 
         try:
             stats_item = StatsItem.from_dict(dct)
@@ -154,25 +164,23 @@ def format_stats(stats: PrimitiveDict) -> StatsDict:
 
     # we always have a 'has_stats' field, it's never included
     has_stats = StatsItem(
-        id='has_stats',
-        label='Has Stats?',
+        id="has_stats",
+        label="Has Stats?",
         value=len(stats_collector) > 0,
-        description='Indicates whether there are statistics for this table',
+        description="Indicates whether there are statistics for this table",
         include=False,
     )
-    stats_collector['has_stats'] = has_stats
+    stats_collector["has_stats"] = has_stats
     return stats_collector
 
 
-def mapping_key(node: CompileResultNode) -> CatalogKey:
+def mapping_key(node: ResultNode) -> CatalogKey:
     dkey = dbt.utils.lowercase(node.database)
-    return CatalogKey(
-        dkey, node.schema.lower(), node.identifier.lower()
-    )
+    return CatalogKey(dkey, node.schema.lower(), node.identifier.lower())
 
 
 def get_unique_id_mapping(
-    manifest: Manifest
+    manifest: Manifest,
 ) -> Tuple[Dict[CatalogKey, str], Dict[CatalogKey, Set[str]]]:
     # A single relation could have multiple unique IDs pointing to it if a
     # source were also a node.
@@ -191,34 +199,21 @@ def get_unique_id_mapping(
 
 
 class GenerateTask(CompileTask):
-    def _get_manifest(self) -> Manifest:
-        if self.manifest is None:
-            raise InternalException(
-                'manifest should not be None in _get_manifest'
-            )
-        return self.manifest
-
     def run(self) -> CatalogArtifact:
         compile_results = None
         if self.args.compile:
             compile_results = CompileTask.run(self)
             if any(r.status == NodeStatus.Error for r in compile_results):
-                print_timestamped_line(
-                    'compile failed, cannot generate docs'
-                )
+                fire_event(CannotGenerateDocs())
                 return CatalogArtifact.from_results(
                     nodes={},
                     sources={},
                     generated_at=datetime.utcnow(),
                     errors=None,
-                    compile_results=compile_results
+                    compile_results=compile_results,
                 )
-        else:
-            self.manifest = ManifestLoader.get_full_manifest(self.config)
 
-        shutil.copyfile(
-            DOCS_INDEX_FILE_PATH,
-            os.path.join(self.config.target_path, 'index.html'))
+        shutil.copyfile(DOCS_INDEX_FILE_PATH, os.path.join(self.config.target_path, "index.html"))
 
         for asset_path in self.config.asset_paths:
             to_asset_path = os.path.join(self.config.target_path, asset_path)
@@ -227,18 +222,14 @@ class GenerateTask(CompileTask):
                 shutil.rmtree(to_asset_path)
 
             if os.path.exists(asset_path):
-                shutil.copytree(
-                    asset_path,
-                    to_asset_path)
+                shutil.copytree(asset_path, to_asset_path)
 
         if self.manifest is None:
-            raise InternalException(
-                'self.manifest was None in run!'
-            )
+            raise DbtInternalError("self.manifest was None in run!")
 
         adapter = get_adapter(self.config)
-        with adapter.connection_named('generate_catalog'):
-            print_timestamped_line("Building catalog")
+        with adapter.connection_named("generate_catalog"):
+            fire_event(BuildingCatalog())
             catalog_table, exceptions = adapter.get_catalog(self.manifest)
 
         catalog_data: List[PrimitiveDict] = [
@@ -264,18 +255,11 @@ class GenerateTask(CompileTask):
         path = os.path.join(self.config.target_path, CATALOG_FILENAME)
         results.write(path)
         if self.args.compile:
-            self.write_manifest()
+            write_manifest(self.manifest, self.config.target_path)
 
         if exceptions:
-            logger.error(
-                'dbt encountered {} failure{} while writing the catalog'
-                .format(len(exceptions), (len(exceptions) != 1) * 's')
-            )
-
-        print_timestamped_line(
-            'Catalog written to {}'.format(os.path.abspath(path))
-        )
-
+            fire_event(WriteCatalogFailure(num_exceptions=len(exceptions)))
+        fire_event(CatalogWritten(path=os.path.abspath(path)))
         return results
 
     def get_catalog_results(
@@ -284,7 +268,7 @@ class GenerateTask(CompileTask):
         sources: Dict[str, CatalogTable],
         generated_at: datetime,
         compile_results: Optional[Any],
-        errors: Optional[List[str]]
+        errors: Optional[List[str]],
     ) -> CatalogArtifact:
         return CatalogArtifact.from_results(
             generated_at=generated_at,
@@ -294,6 +278,7 @@ class GenerateTask(CompileTask):
             errors=errors,
         )
 
+    @classmethod
     def interpret_results(self, results: Optional[CatalogResults]) -> bool:
         if results is None:
             return False

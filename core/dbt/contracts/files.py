@@ -1,42 +1,40 @@
 import hashlib
 import os
 from dataclasses import dataclass, field
+
 from mashumaro.types import SerializableType
 from typing import List, Optional, Union, Dict, Any
 
+from dbt.constants import MAXIMUM_SEED_SIZE
 from dbt.dataclass_schema import dbtClassMixin, StrEnum
 
 from .util import SourceKey
 
 
-MAXIMUM_SEED_SIZE = 1 * 1024 * 1024
-MAXIMUM_SEED_SIZE_NAME = '1MB'
-
-
 class ParseFileType(StrEnum):
-    Macro = 'macro'
-    Model = 'model'
-    Snapshot = 'snapshot'
-    Analysis = 'analysis'
-    SingularTest = 'singular_test'
-    GenericTest = 'generic_test'
-    Seed = 'seed'
-    Documentation = 'docs'
-    Schema = 'schema'
-    Hook = 'hook'   # not a real filetype, from dbt_project.yml
+    Macro = "macro"
+    Model = "model"
+    Snapshot = "snapshot"
+    Analysis = "analysis"
+    SingularTest = "singular_test"
+    GenericTest = "generic_test"
+    Seed = "seed"
+    Documentation = "docs"
+    Schema = "schema"
+    Hook = "hook"  # not a real filetype, from dbt_project.yml
 
 
 parse_file_type_to_parser = {
-    ParseFileType.Macro: 'MacroParser',
-    ParseFileType.Model: 'ModelParser',
-    ParseFileType.Snapshot: 'SnapshotParser',
-    ParseFileType.Analysis: 'AnalysisParser',
-    ParseFileType.SingularTest: 'SingularTestParser',
-    ParseFileType.GenericTest: 'GenericTestParser',
-    ParseFileType.Seed: 'SeedParser',
-    ParseFileType.Documentation: 'DocumentationParser',
-    ParseFileType.Schema: 'SchemaParser',
-    ParseFileType.Hook: 'HookParser',
+    ParseFileType.Macro: "MacroParser",
+    ParseFileType.Model: "ModelParser",
+    ParseFileType.Snapshot: "SnapshotParser",
+    ParseFileType.Analysis: "AnalysisParser",
+    ParseFileType.SingularTest: "SingularTestParser",
+    ParseFileType.GenericTest: "GenericTestParser",
+    ParseFileType.Seed: "SeedParser",
+    ParseFileType.Documentation: "DocumentationParser",
+    ParseFileType.Schema: "SchemaParser",
+    ParseFileType.Hook: "HookParser",
 }
 
 
@@ -55,9 +53,7 @@ class FilePath(dbtClassMixin):
     @property
     def full_path(self) -> str:
         # useful for symlink preservation
-        return os.path.join(
-            self.project_root, self.searched_path, self.relative_path
-        )
+        return os.path.join(self.project_root, self.searched_path, self.relative_path)
 
     @property
     def absolute_path(self) -> str:
@@ -67,13 +63,10 @@ class FilePath(dbtClassMixin):
     def original_file_path(self) -> str:
         # this is mostly used for reporting errors. It doesn't show the project
         # name, should it?
-        return os.path.join(
-            self.searched_path, self.relative_path
-        )
+        return os.path.join(self.searched_path, self.relative_path)
 
     def seed_too_large(self) -> bool:
-        """Return whether the file this represents is over the seed size limit
-        """
+        """Return whether the file this represents is over the seed size limit"""
         return os.stat(self.full_path).st_size > MAXIMUM_SEED_SIZE
 
 
@@ -84,65 +77,75 @@ class FileHash(dbtClassMixin):
 
     @classmethod
     def empty(cls):
-        return FileHash(name='none', checksum='')
+        return FileHash(name="none", checksum="")
 
     @classmethod
     def path(cls, path: str):
-        return FileHash(name='path', checksum=path)
+        return FileHash(name="path", checksum=path)
 
     def __eq__(self, other):
         if not isinstance(other, FileHash):
             return NotImplemented
 
-        if self.name == 'none' or self.name != other.name:
+        if self.name == "none" or self.name != other.name:
             return False
 
         return self.checksum == other.checksum
 
     def compare(self, contents: str) -> bool:
         """Compare the file contents with the given hash"""
-        if self.name == 'none':
+        if self.name == "none":
             return False
 
         return self.from_contents(contents, name=self.name) == self.checksum
 
     @classmethod
-    def from_contents(cls, contents: str, name='sha256') -> 'FileHash':
+    def from_contents(cls, contents: str, name="sha256") -> "FileHash":
         """Create a file hash from the given file contents. The hash is always
         the utf-8 encoding of the contents given, because dbt only reads files
         as utf-8.
         """
-        data = contents.encode('utf-8')
+        data = contents.encode("utf-8")
         checksum = hashlib.new(name, data).hexdigest()
         return cls(name=name, checksum=checksum)
 
 
 @dataclass
 class RemoteFile(dbtClassMixin):
+    def __init__(self, language) -> None:
+        if language == "sql":
+            self.path_end = ".sql"
+        elif language == "python":
+            self.path_end = ".py"
+        else:
+            raise RuntimeError(f"Invalid language for remote File {language}")
+        self.path = f"from remote system{self.path_end}"
+
     @property
     def searched_path(self) -> str:
-        return 'from remote system'
+        return self.path
 
     @property
     def relative_path(self) -> str:
-        return 'from remote system'
+        return self.path
 
     @property
     def absolute_path(self) -> str:
-        return 'from remote system'
+        return self.path
 
     @property
     def original_file_path(self):
-        return 'from remote system'
+        return self.path
 
     @property
     def modification_time(self):
-        return 'from remote system'
+        return self.path
 
 
 @dataclass
 class BaseSourceFile(dbtClassMixin, SerializableType):
     """Define a source file in dbt"""
+
     path: Union[FilePath, RemoteFile]  # the path information
     checksum: FileHash
     # Seems like knowing which project the file came from would be useful
@@ -157,7 +160,7 @@ class BaseSourceFile(dbtClassMixin, SerializableType):
     def file_id(self):
         if isinstance(self.path, RemoteFile):
             return None
-        return f'{self.project_name}://{self.path.original_file_path}'
+        return f"{self.project_name}://{self.path.original_file_path}"
 
     def _serialize(self):
         dct = self.to_dict()
@@ -165,7 +168,7 @@ class BaseSourceFile(dbtClassMixin, SerializableType):
 
     @classmethod
     def _deserialize(cls, dct: Dict[str, int]):
-        if dct['parse_file_type'] == 'schema':
+        if dct["parse_file_type"] == "schema":
             sf = SchemaSourceFile.from_dict(dct)
         else:
             sf = SourceFile.from_dict(dct)
@@ -180,8 +183,8 @@ class BaseSourceFile(dbtClassMixin, SerializableType):
                 del dct[key]
         # remove contents. Schema files will still have 'dict_from_yaml'
         # from the contents
-        if 'contents' in dct:
-            del dct['contents']
+        if "contents" in dct:
+            del dct["contents"]
         return dct
 
 
@@ -193,10 +196,10 @@ class SourceFile(BaseSourceFile):
     env_vars: List[str] = field(default_factory=list)
 
     @classmethod
-    def big_seed(cls, path: FilePath) -> 'SourceFile':
+    def big_seed(cls, path: FilePath) -> "SourceFile":
         """Parse seeds over the size limit with just the path"""
         self = cls(path=path, checksum=FileHash.path(path.original_file_path))
-        self.contents = ''
+        self.contents = ""
         return self
 
     def add_node(self, value):
@@ -206,9 +209,9 @@ class SourceFile(BaseSourceFile):
     # TODO: do this a different way. This remote file kludge isn't going
     # to work long term
     @classmethod
-    def remote(cls, contents: str, project_name: str) -> 'SourceFile':
+    def remote(cls, contents: str, project_name: str, language: str) -> "SourceFile":
         self = cls(
-            path=RemoteFile(),
+            path=RemoteFile(language),
             checksum=FileHash.from_contents(contents),
             project_name=project_name,
             contents=contents,
@@ -224,6 +227,7 @@ class SchemaSourceFile(BaseSourceFile):
     sources: List[str] = field(default_factory=list)
     exposures: List[str] = field(default_factory=list)
     metrics: List[str] = field(default_factory=list)
+    groups: List[str] = field(default_factory=list)
     # node patches contain models, seeds, snapshots, analyses
     ndp: List[str] = field(default_factory=list)
     # any macro patches in this file by macro unique_id.
@@ -255,7 +259,7 @@ class SchemaSourceFile(BaseSourceFile):
     def __post_serialize__(self, dct):
         dct = super().__post_serialize__(dct)
         # Remove partial parsing specific data
-        for key in ('pp_test_index', 'pp_dict'):
+        for key in ("pp_test_index", "pp_dict"):
             if key in dct:
                 del dct[key]
         return dct
@@ -264,19 +268,21 @@ class SchemaSourceFile(BaseSourceFile):
         self.node_patches.append(unique_id)
 
     def add_test(self, node_unique_id, test_from):
-        name = test_from['name']
-        key = test_from['key']
+        name = test_from["name"]
+        key = test_from["key"]
         if key not in self.tests:
             self.tests[key] = {}
         if name not in self.tests[key]:
             self.tests[key][name] = []
         self.tests[key][name].append(node_unique_id)
 
+    # this is only used in unit tests
     def remove_tests(self, yaml_key, name):
         if yaml_key in self.tests:
             if name in self.tests[yaml_key]:
                 del self.tests[yaml_key][name]
 
+    # this is only used in tests (unit + functional)
     def get_tests(self, yaml_key, name):
         if yaml_key in self.tests:
             if name in self.tests[yaml_key]:

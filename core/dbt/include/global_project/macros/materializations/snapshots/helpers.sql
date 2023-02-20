@@ -22,6 +22,13 @@
     {# no-op #}
 {% endmacro %}
 
+{% macro get_true_sql() %}
+  {{ adapter.dispatch('get_true_sql', 'dbt')() }}
+{% endmacro %}
+
+{% macro default__get_true_sql() %}
+    {{ return('TRUE') }}
+{% endmacro %}
 
 {% macro snapshot_staging_table(strategy, source_sql, target_relation) -%}
   {{ adapter.dispatch('snapshot_staging_table', 'dbt')(strategy, source_sql, target_relation) }}
@@ -74,7 +81,7 @@
 
     deletes_source_data as (
 
-        select 
+        select
             *,
             {{ strategy.unique_key }} as dbt_unique_key
         from snapshot_query
@@ -117,7 +124,7 @@
     ,
 
     deletes as (
-    
+
         select
             'delete' as dbt_change_type,
             source_data.*,
@@ -125,7 +132,7 @@
             {{ snapshot_get_time() }} as dbt_updated_at,
             {{ snapshot_get_time() }} as dbt_valid_to,
             snapshotted_data.dbt_scd_id
-    
+
         from snapshotted_data
         left join deletes_source_data as source_data on snapshotted_data.dbt_unique_key = source_data.dbt_unique_key
         where source_data.dbt_unique_key is null
@@ -162,13 +169,13 @@
 
 
 {% macro build_snapshot_staging_table(strategy, sql, target_relation) %}
-    {% set tmp_relation = make_temp_relation(target_relation) %}
+    {% set temp_relation = make_temp_relation(target_relation) %}
 
     {% set select = snapshot_staging_table(strategy, sql, target_relation) %}
 
     {% call statement('build_snapshot_staging_relation') %}
-        {{ create_table_as(True, tmp_relation, select) }}
+        {{ create_table_as(True, temp_relation, select) }}
     {% endcall %}
 
-    {% do return(tmp_relation) %}
+    {% do return(temp_relation) %}
 {% endmacro %}

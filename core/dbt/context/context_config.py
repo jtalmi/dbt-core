@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from typing import List, Iterator, Dict, Any, TypeVar, Generic
 
 from dbt.config import RuntimeConfig, Project, IsFQNResource
-from dbt.contracts.graph.model_config import BaseConfig, get_config_for
-from dbt.exceptions import InternalException
+from dbt.contracts.graph.model_config import BaseConfig, get_config_for, _listify
+from dbt.exceptions import DbtInternalError
 from dbt.node_types import NodeType
 from dbt.utils import fqn_search
 
@@ -17,8 +17,8 @@ class ModelParts(IsFQNResource):
     package_name: str
 
 
-T = TypeVar('T')  # any old type
-C = TypeVar('C', bound=BaseConfig)
+T = TypeVar("T")  # any old type
+C = TypeVar("C", bound=BaseConfig)
 
 
 class ConfigSource:
@@ -36,16 +36,19 @@ class UnrenderedConfig(ConfigSource):
     def get_config_dict(self, resource_type: NodeType) -> Dict[str, Any]:
         unrendered = self.project.unrendered.project_dict
         if resource_type == NodeType.Seed:
-            model_configs = unrendered.get('seeds')
+            model_configs = unrendered.get("seeds")
         elif resource_type == NodeType.Snapshot:
-            model_configs = unrendered.get('snapshots')
+            model_configs = unrendered.get("snapshots")
         elif resource_type == NodeType.Source:
-            model_configs = unrendered.get('sources')
+            model_configs = unrendered.get("sources")
         elif resource_type == NodeType.Test:
-            model_configs = unrendered.get('tests')
+            model_configs = unrendered.get("tests")
+        elif resource_type == NodeType.Metric:
+            model_configs = unrendered.get("metrics")
+        elif resource_type == NodeType.Exposure:
+            model_configs = unrendered.get("exposures")
         else:
-            model_configs = unrendered.get('models')
-
+            model_configs = unrendered.get("models")
         if model_configs is None:
             return {}
         else:
@@ -65,6 +68,10 @@ class RenderedConfig(ConfigSource):
             model_configs = self.project.sources
         elif resource_type == NodeType.Test:
             model_configs = self.project.tests
+        elif resource_type == NodeType.Metric:
+            model_configs = self.project.metrics
+        elif resource_type == NodeType.Exposure:
+            model_configs = self.project.exposures
         else:
             model_configs = self.project.models
         return model_configs
@@ -82,9 +89,9 @@ class BaseContextConfigGenerator(Generic[T]):
             return self._active_project
         dependencies = self._active_project.load_dependencies()
         if project_name not in dependencies:
-            raise InternalException(
-                f'Project name {project_name} not found in dependencies '
-                f'(found {list(dependencies)})'
+            raise DbtInternalError(
+                f"Project name {project_name} not found in dependencies "
+                f"(found {list(dependencies)})"
             )
         return dependencies[project_name]
 
@@ -96,7 +103,7 @@ class BaseContextConfigGenerator(Generic[T]):
         for level_config in fqn_search(model_configs, fqn):
             result = {}
             for key, value in level_config.items():
-                if key.startswith('+'):
+                if key.startswith("+"):
                     result[key[1:].strip()] = deepcopy(value)
                 elif not isinstance(value, dict):
                     result[key] = deepcopy(value)
@@ -109,9 +116,7 @@ class BaseContextConfigGenerator(Generic[T]):
         return self._project_configs(self._active_project, fqn, resource_type)
 
     @abstractmethod
-    def _update_from_config(
-        self, result: T, partial: Dict[str, Any], validate: bool = False
-    ) -> T:
+    def _update_from_config(self, result: T, partial: Dict[str, Any], validate: bool = False) -> T:
         ...
 
     @abstractmethod
@@ -125,7 +130,7 @@ class BaseContextConfigGenerator(Generic[T]):
         resource_type: NodeType,
         project_name: str,
         base: bool,
-        patch_config_dict: Dict[str, Any] = None
+        patch_config_dict: Dict[str, Any] = None,
     ) -> BaseConfig:
         own_config = self.get_node_project(project_name)
 
@@ -150,7 +155,8 @@ class BaseContextConfigGenerator(Generic[T]):
                 result = self._update_from_config(result, fqn_config)
 
         # this is mostly impactful in the snapshot config case
-        return result
+        # TODO CT-211
+        return result  # type: ignore[return-value]
 
     @abstractmethod
     def calculate_node_config_dict(
@@ -181,16 +187,10 @@ class ContextConfigGenerator(BaseContextConfigGenerator[C]):
         result = config_cls.from_dict({})
         return result
 
-    def _update_from_config(
-        self, result: C, partial: Dict[str, Any], validate: bool = False
-    ) -> C:
-        translated = self._active_project.credentials.translate_aliases(
-            partial
-        )
+    def _update_from_config(self, result: C, partial: Dict[str, Any], validate: bool = False) -> C:
+        translated = self._active_project.credentials.translate_aliases(partial)
         return result.update_from(
-            translated,
-            self._active_project.credentials.type,
-            validate=validate
+            translated, self._active_project.credentials.type, validate=validate
         )
 
     def calculate_node_config_dict(
@@ -200,7 +200,7 @@ class ContextConfigGenerator(BaseContextConfigGenerator[C]):
         resource_type: NodeType,
         project_name: str,
         base: bool,
-        patch_config_dict: dict = None
+        patch_config_dict: dict = None,
     ) -> Dict[str, Any]:
         config = self.calculate_node_config(
             config_call_dict=config_call_dict,
@@ -208,7 +208,7 @@ class ContextConfigGenerator(BaseContextConfigGenerator[C]):
             resource_type=resource_type,
             project_name=project_name,
             base=base,
-            patch_config_dict=patch_config_dict
+            patch_config_dict=patch_config_dict,
         )
         finalized = config.finalize_and_validate()
         return finalized.to_dict(omit_none=True)
@@ -225,22 +225,19 @@ class UnrenderedConfigGenerator(BaseContextConfigGenerator[Dict[str, Any]]):
         resource_type: NodeType,
         project_name: str,
         base: bool,
-        patch_config_dict: dict = None
+        patch_config_dict: dict = None,
     ) -> Dict[str, Any]:
+        # TODO CT-211
         return self.calculate_node_config(
             config_call_dict=config_call_dict,
             fqn=fqn,
             resource_type=resource_type,
             project_name=project_name,
             base=base,
-            patch_config_dict=patch_config_dict
-        )
+            patch_config_dict=patch_config_dict,
+        )  # type: ignore[return-value]
 
-    def initial_result(
-        self,
-        resource_type: NodeType,
-        base: bool
-    ) -> Dict[str, Any]:
+    def initial_result(self, resource_type: NodeType, base: bool) -> Dict[str, Any]:
         return {}
 
     def _update_from_config(
@@ -249,9 +246,7 @@ class UnrenderedConfigGenerator(BaseContextConfigGenerator[Dict[str, Any]]):
         partial: Dict[str, Any],
         validate: bool = False,
     ) -> Dict[str, Any]:
-        translated = self._active_project.credentials.translate_aliases(
-            partial
-        )
+        translated = self._active_project.credentials.translate_aliases(partial)
         result.update(translated)
         return result
 
@@ -276,32 +271,61 @@ class ContextConfig:
 
     @classmethod
     def _add_config_call(cls, config_call_dict, opts: Dict[str, Any]) -> None:
+        # config_call_dict is already encountered configs, opts is new
+        # This mirrors code in _merge_field_value in model_config.py which is similar but
+        # operates on config objects.
         for k, v in opts.items():
             # MergeBehavior for post-hook and pre-hook is to collect all
             # values, instead of overwriting
-            if k in BaseConfig.mergebehavior['append']:
+            if k in BaseConfig.mergebehavior["append"]:
                 if not isinstance(v, list):
                     v = [v]
-            if k in BaseConfig.mergebehavior['update'] and not isinstance(v, dict):
-                raise InternalException(f'expected dict, got {v}')
-            if k in config_call_dict and isinstance(config_call_dict[k], list):
-                config_call_dict[k].extend(v)
-            elif k in config_call_dict and isinstance(config_call_dict[k], dict):
-                config_call_dict[k].update(v)
+                if k in config_call_dict:  # should always be a list here
+                    config_call_dict[k].extend(v)
+                else:
+                    config_call_dict[k] = v
+
+            elif k in BaseConfig.mergebehavior["update"]:
+                if not isinstance(v, dict):
+                    raise DbtInternalError(f"expected dict, got {v}")
+                if k in config_call_dict and isinstance(config_call_dict[k], dict):
+                    config_call_dict[k].update(v)
+                else:
+                    config_call_dict[k] = v
+            elif k in BaseConfig.mergebehavior["dict_key_append"]:
+                if not isinstance(v, dict):
+                    raise DbtInternalError(f"expected dict, got {v}")
+                if k in config_call_dict:  # should always be a dict
+                    for key, value in v.items():
+                        extend = False
+                        # This might start with a +, to indicate we should extend the list
+                        # instead of just clobbering it
+                        if key.startswith("+"):
+                            extend = True
+                        if key in config_call_dict[k] and extend:
+                            # extend the list
+                            config_call_dict[k][key].extend(_listify(value))
+                        else:
+                            # clobber the list
+                            config_call_dict[k][key] = _listify(value)
+                else:
+                    # This is always a dictionary
+                    config_call_dict[k] = v
+                    # listify everything
+                    for key, value in config_call_dict[k].items():
+                        config_call_dict[k][key] = _listify(value)
             else:
                 config_call_dict[k] = v
 
     def build_config_dict(
-        self,
-        base: bool = False,
-        *,
-        rendered: bool = True,
-        patch_config_dict: dict = None
+        self, base: bool = False, *, rendered: bool = True, patch_config_dict: dict = None
     ) -> Dict[str, Any]:
         if rendered:
-            src = ContextConfigGenerator(self._active_project)
+            # TODO CT-211
+            src = ContextConfigGenerator(self._active_project)  # type: ignore[var-annotated]
         else:
-            src = UnrenderedConfigGenerator(self._active_project)
+            # TODO CT-211
+            src = UnrenderedConfigGenerator(self._active_project)  # type: ignore[assignment]
 
         return src.calculate_node_config_dict(
             config_call_dict=self._config_call_dict,
@@ -309,5 +333,5 @@ class ContextConfig:
             resource_type=self._resource_type,
             project_name=self._project_name,
             base=base,
-            patch_config_dict=patch_config_dict
+            patch_config_dict=patch_config_dict,
         )

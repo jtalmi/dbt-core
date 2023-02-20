@@ -1,18 +1,26 @@
 import json
 import os
-from typing import (
-    Any, Dict, NoReturn, Optional, Mapping
-)
+from typing import Any, Dict, NoReturn, Optional, Mapping, Iterable, Set, List
 
-from dbt import flags
+from dbt.flags import get_flags
+import dbt.flags as flags_module
 from dbt import tracking
+from dbt import utils
 from dbt.clients.jinja import get_rendered
-from dbt.clients.yaml_helper import (  # noqa: F401
-    yaml, safe_load, SafeLoader, Loader, Dumper
+from dbt.clients.yaml_helper import yaml, safe_load, SafeLoader, Loader, Dumper  # noqa: F401
+from dbt.constants import SECRET_ENV_PREFIX, DEFAULT_ENV_PLACEHOLDER
+from dbt.contracts.graph.nodes import Resource
+from dbt.exceptions import (
+    SecretEnvVarLocationError,
+    EnvVarMissingError,
+    MacroReturn,
+    RequiredVarNotFoundError,
+    SetStrictWrongTypeError,
+    ZipStrictWrongTypeError,
 )
-from dbt.contracts.graph.compiled import CompiledResource
-from dbt.exceptions import raise_compiler_error, MacroReturn, raise_parsing_error
-from dbt.logger import GLOBAL_LOGGER as logger
+from dbt.events.functions import fire_event, get_invocation_id
+from dbt.events.types import JinjaLogInfo, JinjaLogDebug
+from dbt.events.contextvars import get_node_info
 from dbt.version import __version__ as dbt_version
 
 # These modules are added to the context. Consider alternative
@@ -20,75 +28,59 @@ from dbt.version import __version__ as dbt_version
 import pytz
 import datetime
 import re
+import itertools
 
-# Contexts in dbt Core
-# Contexts are used for Jinja rendering. They include context methods,
-# executable macros, and various settings that are available in Jinja.
-#
-# Different contexts are used in different places because we allow access
-# to different methods and data in different places. Executable SQL, for
-# example, includes the available macros and the model, while Jinja in
-# yaml files is more limited.
-#
-# The context that is passed to Jinja is always in a dictionary format,
-# not an actual class, so a 'to_dict()' is executed on a context class
-# before it is used for rendering.
-#
-# Each context has a generate_<name>_context function to create the context.
-# ProviderContext subclasses have different generate functions for
-# parsing and for execution.
-#
-# Context class hierarchy
-#
-#   BaseContext -- core/dbt/context/base.py
-#     TargetContext -- core/dbt/context/target.py
-#       ConfiguredContext -- core/dbt/context/configured.py
-#         SchemaYamlContext -- core/dbt/context/configured.py
-#           DocsRuntimeContext -- core/dbt/context/configured.py
-#         MacroResolvingContext -- core/dbt/context/configured.py
-#         ManifestContext -- core/dbt/context/manifest.py
-#           QueryHeaderContext -- core/dbt/context/manifest.py
-#           ProviderContext -- core/dbt/context/provider.py
-#             MacroContext -- core/dbt/context/provider.py
-#             ModelContext -- core/dbt/context/provider.py
-#             TestContext -- core/dbt/context/provider.py
+# See the `contexts` module README for more information on how contexts work
 
 
 def get_pytz_module_context() -> Dict[str, Any]:
     context_exports = pytz.__all__  # type: ignore
 
-    return {
-        name: getattr(pytz, name) for name in context_exports
-    }
+    return {name: getattr(pytz, name) for name in context_exports}
 
 
 def get_datetime_module_context() -> Dict[str, Any]:
-    context_exports = [
-        'date',
-        'datetime',
-        'time',
-        'timedelta',
-        'tzinfo'
-    ]
+    context_exports = ["date", "datetime", "time", "timedelta", "tzinfo"]
 
-    return {
-        name: getattr(datetime, name) for name in context_exports
-    }
+    return {name: getattr(datetime, name) for name in context_exports}
 
 
 def get_re_module_context() -> Dict[str, Any]:
-    context_exports = re.__all__
+    # TODO CT-211
+    context_exports = re.__all__  # type: ignore[attr-defined]
 
-    return {
-        name: getattr(re, name) for name in context_exports
-    }
+    return {name: getattr(re, name) for name in context_exports}
+
+
+def get_itertools_module_context() -> Dict[str, Any]:
+    # Excluded dropwhile, filterfalse, takewhile and groupby;
+    # first 3 illogical for Jinja and last redundant.
+    context_exports = [
+        "count",
+        "cycle",
+        "repeat",
+        "accumulate",
+        "chain",
+        "compress",
+        "islice",
+        "starmap",
+        "tee",
+        "zip_longest",
+        "product",
+        "permutations",
+        "combinations",
+        "combinations_with_replacement",
+    ]
+
+    return {name: getattr(itertools, name) for name in context_exports}
 
 
 def get_context_modules() -> Dict[str, Dict[str, Any]]:
     return {
-        'pytz': get_pytz_module_context(),
-        'datetime': get_datetime_module_context(),
-        're': get_re_module_context(),
+        "pytz": get_pytz_module_context(),
+        "datetime": get_datetime_module_context(),
+        "re": get_re_module_context(),
+        "itertools": get_itertools_module_context(),
     }
 
 
@@ -122,8 +114,8 @@ class ContextMeta(type):
         new_dct = {}
 
         for base in bases:
-            context_members.update(getattr(base, '_context_members_', {}))
-            context_attrs.update(getattr(base, '_context_attrs_', {}))
+            context_members.update(getattr(base, "_context_members_", {}))
+            context_attrs.update(getattr(base, "_context_attrs_", {}))
 
         for key, value in dct.items():
             if isinstance(value, ContextMember):
@@ -132,25 +124,23 @@ class ContextMeta(type):
                 context_attrs[context_key] = key
                 value = value.inner
             new_dct[key] = value
-        new_dct['_context_members_'] = context_members
-        new_dct['_context_attrs_'] = context_attrs
+        new_dct["_context_members_"] = context_members
+        new_dct["_context_attrs_"] = context_attrs
         return type.__new__(mcls, name, bases, new_dct)
 
 
 class Var:
-    UndefinedVarError = "Required var '{}' not found in config:\nVars "\
-                        "supplied to {} = {}"
     _VAR_NOTSET = object()
 
     def __init__(
         self,
         context: Mapping[str, Any],
         cli_vars: Mapping[str, Any],
-        node: Optional[CompiledResource] = None
+        node: Optional[Resource] = None,
     ) -> None:
         self._context: Mapping[str, Any] = context
         self._cli_vars: Mapping[str, Any] = cli_vars
-        self._node: Optional[CompiledResource] = node
+        self._node: Optional[Resource] = node
         self._merged: Mapping[str, Any] = self._generate_merged()
 
     def _generate_merged(self) -> Mapping[str, Any]:
@@ -161,15 +151,10 @@ class Var:
         if self._node is not None:
             return self._node.name
         else:
-            return '<Configuration>'
+            return "<Configuration>"
 
     def get_missing_var(self, var_name):
-        dct = {k: self._merged[k] for k in self._merged}
-        pretty_vars = json.dumps(dct, sort_keys=True, indent=4)
-        msg = self.UndefinedVarError.format(
-            var_name, self.node_name, pretty_vars
-        )
-        raise_compiler_error(msg, self._node)
+        raise RequiredVarNotFoundError(var_name, self._merged, self._node)
 
     def has_var(self, var_name: str):
         return var_name in self._merged
@@ -201,7 +186,7 @@ class BaseContext(metaclass=ContextMeta):
     def generate_builtins(self):
         builtins: Dict[str, Any] = {}
         for key, value in self._context_members_.items():
-            if hasattr(value, '__get__'):
+            if hasattr(value, "__get__"):
                 # handle properties, bound methods, etc
                 value = value.__get__(self)
             builtins[key] = value
@@ -209,9 +194,9 @@ class BaseContext(metaclass=ContextMeta):
 
     # no dbtClassMixin so this is not an actual override
     def to_dict(self):
-        self._ctx['context'] = self._ctx
+        self._ctx["context"] = self._ctx
         builtins = self.generate_builtins()
-        self._ctx['builtins'] = builtins
+        self._ctx["builtins"] = builtins
         self._ctx.update(builtins)
         return self._ctx
 
@@ -312,30 +297,38 @@ class BaseContext(metaclass=ContextMeta):
         If the default is None, raise an exception for an undefined variable.
         """
         return_value = None
+        if var.startswith(SECRET_ENV_PREFIX):
+            raise SecretEnvVarLocationError(var)
         if var in os.environ:
             return_value = os.environ[var]
         elif default is not None:
             return_value = default
 
         if return_value is not None:
-            self.env_vars[var] = return_value
+            # If the environment variable is set from a default, store a string indicating
+            # that so we can skip partial parsing.  Otherwise the file will be scheduled for
+            # reparsing. If the default changes, the file will have been updated and therefore
+            # will be scheduled for reparsing anyways.
+            self.env_vars[var] = return_value if var in os.environ else DEFAULT_ENV_PLACEHOLDER
+
             return return_value
         else:
-            msg = f"Env var required but not provided: '{var}'"
-            raise_parsing_error(msg)
+            raise EnvVarMissingError(var)
 
-    if os.environ.get('DBT_MACRO_DEBUGGING'):
+    if os.environ.get("DBT_MACRO_DEBUGGING"):
+
         @contextmember
         @staticmethod
         def debug():
             """Enter a debugger at this line in the compiled jinja code."""
             import sys
             import ipdb  # type: ignore
+
             frame = sys._getframe(3)
             ipdb.set_trace(frame)
-            return ''
+            return ""
 
-    @contextmember('return')
+    @contextmember("return")
     @staticmethod
     def _return(data: Any) -> NoReturn:
         """The `return` function can be used in macros to return data to the
@@ -386,9 +379,7 @@ class BaseContext(metaclass=ContextMeta):
 
     @contextmember
     @staticmethod
-    def tojson(
-        value: Any, default: Any = None, sort_keys: bool = False
-    ) -> Any:
+    def tojson(value: Any, default: Any = None, sort_keys: bool = False) -> Any:
         """The `tojson` context method can be used to serialize a Python
         object primitive, eg. a `dict` or `list` to a json string.
 
@@ -465,6 +456,90 @@ class BaseContext(metaclass=ContextMeta):
         except (ValueError, yaml.YAMLError):
             return default
 
+    @contextmember("set")
+    @staticmethod
+    def _set(value: Iterable[Any], default: Any = None) -> Optional[Set[Any]]:
+        """The `set` context method can be used to convert any iterable
+        to a sequence of iterable elements that are unique (a set).
+
+        :param value: The iterable
+        :param default: A default value to return if the `value` argument
+            is not an iterable
+
+        Usage:
+            {% set my_list = [1, 2, 2, 3] %}
+            {% set my_set = set(my_list) %}
+            {% do log(my_set) %}  {# {1, 2, 3} #}
+        """
+        try:
+            return set(value)
+        except TypeError:
+            return default
+
+    @contextmember
+    @staticmethod
+    def set_strict(value: Iterable[Any]) -> Set[Any]:
+        """The `set_strict` context method can be used to convert any iterable
+        to a sequence of iterable elements that are unique (a set). The
+        difference to the `set` context method is that the `set_strict` method
+        will raise an exception on a TypeError.
+
+        :param value: The iterable
+
+        Usage:
+            {% set my_list = [1, 2, 2, 3] %}
+            {% set my_set = set_strict(my_list) %}
+            {% do log(my_set) %}  {# {1, 2, 3} #}
+        """
+        try:
+            return set(value)
+        except TypeError as e:
+            raise SetStrictWrongTypeError(e)
+
+    @contextmember("zip")
+    @staticmethod
+    def _zip(*args: Iterable[Any], default: Any = None) -> Optional[Iterable[Any]]:
+        """The `zip` context method can be used to used to return
+        an iterator of tuples, where the i-th tuple contains the i-th
+        element from each of the argument iterables.
+
+        :param *args: Any number of iterables
+        :param default: A default value to return if `*args` is not
+            iterable
+
+        Usage:
+            {% set my_list_a = [1, 2] %}
+            {% set my_list_b = ['alice', 'bob'] %}
+            {% set my_zip = zip(my_list_a, my_list_b) | list %}
+            {% do log(my_set) %}  {# [(1, 'alice'), (2, 'bob')] #}
+        """
+        try:
+            return zip(*args)
+        except TypeError:
+            return default
+
+    @contextmember
+    @staticmethod
+    def zip_strict(*args: Iterable[Any]) -> Iterable[Any]:
+        """The `zip_strict` context method can be used to used to return
+        an iterator of tuples, where the i-th tuple contains the i-th
+        element from each of the argument iterables. The difference to the
+        `zip` context method is that the `zip_strict` method will raise an
+        exception on a TypeError.
+
+        :param *args: Any number of iterables
+
+        Usage:
+            {% set my_list_a = [1, 2] %}
+            {% set my_list_b = ['alice', 'bob'] %}
+            {% set my_zip = zip_strict(my_list_a, my_list_b) | list %}
+            {% do log(my_set) %}  {# [(1, 'alice'), (2, 'bob')] #}
+        """
+        try:
+            return zip(*args)
+        except TypeError as e:
+            raise ZipStrictWrongTypeError(e)
+
     @contextmember
     @staticmethod
     def log(msg: str, info: bool = False) -> str:
@@ -481,10 +556,10 @@ class BaseContext(metaclass=ContextMeta):
             {% endmacro %}"
         """
         if info:
-            logger.info(msg)
+            fire_event(JinjaLogInfo(msg=msg, node_info=get_node_info()))
         else:
-            logger.debug(msg)
-        return ''
+            fire_event(JinjaLogDebug(msg=msg, node_info=get_node_info()))
+        return ""
 
     @contextproperty
     def run_started_at(self) -> Optional[datetime.datetime]:
@@ -519,10 +594,7 @@ class BaseContext(metaclass=ContextMeta):
         """invocation_id outputs a UUID generated for this dbt run (useful for
         auditing)
         """
-        if tracking.active_user is not None:
-            return tracking.active_user.invocation_id
-        else:
-            return None
+        return get_invocation_id()
 
     @contextproperty
     def modules(self) -> Dict[str, Any]:
@@ -563,9 +635,68 @@ class BaseContext(metaclass=ContextMeta):
             {% endif %}
 
         This supports all flags defined in flags submodule (core/dbt/flags.py)
-        TODO: Replace with object that provides read-only access to flag values
         """
-        return flags
+        return flags_module.get_flag_obj()
+
+    @contextmember
+    @staticmethod
+    def print(msg: str) -> str:
+        """Prints a line to stdout.
+
+        :param msg: The message to print
+
+        > macros/my_log_macro.sql
+
+            {% macro some_macro(arg1, arg2) %}
+              {{ print("Running some_macro: " ~ arg1 ~ ", " ~ arg2) }}
+            {% endmacro %}"
+        """
+
+        if not get_flags().PRINT:
+            print(msg)
+        return ""
+
+    @contextmember
+    @staticmethod
+    def diff_of_two_dicts(
+        dict_a: Dict[str, List[str]], dict_b: Dict[str, List[str]]
+    ) -> Dict[str, List[str]]:
+        """
+        Given two dictionaries of type Dict[str, List[str]]:
+            dict_a = {'key_x': ['value_1', 'VALUE_2'], 'KEY_Y': ['value_3']}
+            dict_b = {'key_x': ['value_1'], 'key_z': ['value_4']}
+        Return the same dictionary representation of dict_a MINUS dict_b,
+        performing a case-insensitive comparison between the strings in each.
+        All keys returned will be in the original case of dict_a.
+            returns {'key_x': ['VALUE_2'], 'KEY_Y': ['value_3']}
+        """
+
+        dict_diff = {}
+        dict_b_lowered = {k.casefold(): [x.casefold() for x in v] for k, v in dict_b.items()}
+        for k in dict_a:
+            if k.casefold() in dict_b_lowered.keys():
+                diff = []
+                for v in dict_a[k]:
+                    if v.casefold() not in dict_b_lowered[k.casefold()]:
+                        diff.append(v)
+                if diff:
+                    dict_diff.update({k: diff})
+            else:
+                dict_diff.update({k: dict_a[k]})
+        return dict_diff
+
+    @contextmember
+    @staticmethod
+    def local_md5(value: str) -> str:
+        """Calculates an MD5 hash of the given string.
+        It's called "local_md5" to emphasize that it runs locally in dbt (in jinja context) and not an MD5 SQL command.
+
+        :param value: The value to hash
+
+        Usage:
+            {% set value_hash = local_md5("hello world") %}
+        """
+        return utils.md5(value)
 
 
 def generate_base_context(cli_vars: Dict[str, Any]) -> Dict[str, Any]:

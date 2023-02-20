@@ -6,23 +6,26 @@ import shutil
 import tempfile
 import unittest
 import pytest
+from argparse import Namespace
 
 from unittest import mock
 import yaml
 
 import dbt.config
 import dbt.exceptions
+import dbt.tracking
 from dbt import flags
 from dbt.adapters.factory import load_plugin
 from dbt.adapters.postgres import PostgresCredentials
-from dbt.context.base import generate_base_context
 from dbt.contracts.connection import QueryComment, DEFAULT_QUERY_COMMENT
 from dbt.contracts.project import PackageConfig, LocalPackage, GitPackage
 from dbt.node_types import NodeType
 from dbt.semver import VersionSpecifier
-from dbt.task.run_operation import RunOperationTask
+from dbt.task.base import ConfiguredTask
 
-from .utils import normalize, config_from_parts_or_dicts
+from dbt.flags import set_from_args
+
+from .utils import normalize
 
 INITIAL_ROOT = os.getcwd()
 
@@ -88,10 +91,10 @@ model_fqns = frozenset((
 
 class Args:
     def __init__(self, profiles_dir=None, threads=None, profile=None,
-                 cli_vars=None, version_check=None, project_dir=None):
+                 cli_vars=None, version_check=None, project_dir=None, target=None):
         self.profile = profile
-        if threads is not None:
-            self.threads = threads
+        self.threads = threads
+        self.target = target
         if profiles_dir is not None:
             self.profiles_dir = profiles_dir
             flags.PROFILES_DIR = profiles_dir
@@ -165,8 +168,8 @@ class BaseConfigTest(unittest.TestCase):
             },
             'empty_profile_data': {}
         }
-        self.args = Args(profiles_dir=self.profiles_dir, cli_vars='{}',
-                         version_check=True, project_dir=self.project_dir)
+        self.args = Namespace(profiles_dir=self.profiles_dir, cli_vars={}, version_check=True, project_dir=self.project_dir, target=None, threads=None, profile=None)
+        set_from_args(self.args, None)
         self.env_override = {
             'env_value_type': 'postgres',
             'env_value_host': 'env-postgres-host',
@@ -317,7 +320,7 @@ class TestProfile(BaseConfigTest):
             'model-paths': ['models'],
             'source-paths': ['other-models'],
         })
-        with self.assertRaises(dbt.exceptions.DbtProjectError) as exc:            
+        with self.assertRaises(dbt.exceptions.DbtProjectError) as exc:
             project = project_from_config_norender(self.default_project_data)
 
         self.assertIn('source-paths and model-paths', str(exc.exception))
@@ -404,12 +407,14 @@ class TestProfileFile(BaseFileTest):
 
     def from_args(self, project_profile_name='default', **kwargs):
         kw = {
-            'args': self.args,
             'project_profile_name': project_profile_name,
-            'renderer': empty_profile_renderer()
+            'renderer': empty_profile_renderer(),
+            'threads_override': self.args.threads,
+            'target_override': self.args.target,
+            'profile_name_override': self.args.profile,
         }
         kw.update(kwargs)
-        return dbt.config.Profile.render_from_args(**kw)
+        return dbt.config.Profile.render(**kw)
 
     def test_profile_simple(self):
         profile = self.from_args()
@@ -433,6 +438,7 @@ class TestProfileFile(BaseFileTest):
     def test_profile_override(self):
         self.args.profile = 'other'
         self.args.threads = 3
+        set_from_args(self.args, None)
         profile = self.from_args()
         from_raw = self.from_raw_profile_info(
                 self.default_profile_data['other'],
@@ -508,7 +514,7 @@ class TestProfileFile(BaseFileTest):
 
     def test_cli_and_env_vars(self):
         self.args.target = 'cli-and-env-vars'
-        self.args.vars = '{"cli_value_host": "cli-postgres-host"}'
+        self.args.vars = {"cli_value_host": "cli-postgres-host"}
         renderer = dbt.config.renderer.ProfileRenderer({'cli_value_host': 'cli-postgres-host'})
         with mock.patch.dict(os.environ, self.env_override):
             profile = self.from_args(renderer=renderer)
@@ -602,7 +608,7 @@ class TestProject(BaseConfigTest):
         self.assertEqual(project.seed_paths, ['seeds'])
         self.assertEqual(project.test_paths, ['tests'])
         self.assertEqual(project.analysis_paths, ['analyses'])
-        self.assertEqual(project.docs_paths, ['models', 'seeds', 'snapshots', 'analyses', 'macros'])
+        self.assertEqual(set(project.docs_paths), set(['models', 'seeds', 'snapshots', 'analyses', 'macros']))
         self.assertEqual(project.asset_paths, [])
         self.assertEqual(project.target_path, 'target')
         self.assertEqual(project.clean_targets, ['target'])
@@ -635,7 +641,7 @@ class TestProject(BaseConfigTest):
             'target-path': 'other-target',
         })
         project = project_from_config_norender(self.default_project_data)
-        self.assertEqual(project.docs_paths, ['other-models', 'seeds', 'snapshots', 'analyses', 'macros'])
+        self.assertEqual(set(project.docs_paths), set(['other-models', 'seeds', 'snapshots', 'analyses', 'macros']))
         self.assertEqual(project.clean_targets, ['other-target'])
 
     def test_hashed_name(self):
@@ -643,6 +649,7 @@ class TestProject(BaseConfigTest):
         self.assertEqual(project.hashed_name(), '754cd47eac1d6f50a5f7cd399ec43da4')
 
     def test_all_overrides(self):
+        # log-path is not tested because it is set exclusively from flags, not cfg
         self.default_project_data.update({
             'model-paths': ['other-models'],
             'macro-paths': ['other-macros'],
@@ -653,7 +660,6 @@ class TestProject(BaseConfigTest):
             'asset-paths': ['other-assets'],
             'target-path': 'other-target',
             'clean-targets': ['another-target'],
-            'log-path': 'other-logs',
             'packages-install-path': 'other-dbt_packages',
             'quoting': {'identifier': False},
             'models': {
@@ -723,7 +729,6 @@ class TestProject(BaseConfigTest):
         self.assertEqual(project.asset_paths, ['other-assets'])
         self.assertEqual(project.target_path, 'other-target')
         self.assertEqual(project.clean_targets, ['another-target'])
-        self.assertEqual(project.log_path, 'other-logs')
         self.assertEqual(project.packages_install_path, 'other-dbt_packages')
         self.assertEqual(project.quoting, {'identifier': False})
         self.assertEqual(project.models, {
@@ -798,7 +803,7 @@ class TestProject(BaseConfigTest):
         with self.assertRaises(dbt.exceptions.DbtProjectError) as exc:
             dbt.config.Project.from_project_root(self.project_dir, renderer)
 
-        self.assertIn('no dbt_project.yml', str(exc.exception))
+        self.assertIn('No dbt_project.yml', str(exc.exception))
 
     def test_invalid_version(self):
         self.default_project_data['require-dbt-version'] = 'hello!'
@@ -907,7 +912,12 @@ class TestProjectFile(BaseFileTest):
             dbt.config.Project.from_project_root(self.project_dir, renderer)
 
 
-class TestRunOperationTask(BaseFileTest):
+class InheritsFromConfiguredTask(ConfiguredTask):
+    def run(self):
+        pass
+
+
+class TestConfiguredTask(BaseFileTest):
     def setUp(self):
         super().setUp()
         self.write_project(self.default_project_data)
@@ -919,17 +929,17 @@ class TestRunOperationTask(BaseFileTest):
         # so it's necessary to change it back at the end.
         os.chdir(INITIAL_ROOT)
 
-    def test_run_operation_task(self):
+    def test_configured_task_dir_change(self):
         self.assertEqual(os.getcwd(), INITIAL_ROOT)
         self.assertNotEqual(INITIAL_ROOT, self.project_dir)
-        new_task = RunOperationTask.from_args(self.args)
+        InheritsFromConfiguredTask.from_args(self.args)
         self.assertEqual(os.path.realpath(os.getcwd()),
                          os.path.realpath(self.project_dir))
 
-    def test_run_operation_task_with_bad_path(self):
+    def test_configured_task_dir_change_with_bad_path(self):
         self.args.project_dir = 'bad_path'
-        with self.assertRaises(dbt.exceptions.RuntimeException):
-            new_task = RunOperationTask.from_args(self.args)
+        with self.assertRaises(dbt.exceptions.DbtRuntimeError):
+            InheritsFromConfiguredTask.from_args(self.args)
 
 
 class TestVariableProjectFile(BaseFileTest):
@@ -1033,6 +1043,7 @@ class TestRuntimeConfig(BaseConfigTest):
     def test_unsupported_version_no_check(self):
         self.default_project_data['require-dbt-version'] = '>99999.0.0'
         self.args.version_check = False
+        set_from_args(self.args, None)
         conf = self.from_parts()
         self.assertEqual(set(x.to_version_string() for x in conf.dbt_version), {'>99999.0.0'})
 
@@ -1055,6 +1066,7 @@ class TestRuntimeConfig(BaseConfigTest):
     def test_unsupported_version_range_no_check(self):
         self.default_project_data['require-dbt-version'] = ['>0.0.0', '<=0.0.1']
         self.args.version_check = False
+        set_from_args(self.args, None)
         conf = self.from_parts()
         self.assertEqual(set(x.to_version_string() for x in conf.dbt_version), {'>0.0.0', '<=0.0.1'})
 
@@ -1084,35 +1096,6 @@ class TestRuntimeConfig(BaseConfigTest):
         with self.assertRaises(dbt.exceptions.DbtProjectError):
             self.get_project()
 
-    def test__no_unused_resource_config_paths(self):
-        self.default_project_data.update({
-            'models': model_config,
-            'seeds': {},
-        })
-        project = self.from_parts()
-
-        resource_fqns = {'models': model_fqns}
-        unused = project.get_unused_resource_config_paths(resource_fqns, [])
-        self.assertEqual(len(unused), 0)
-
-    def test__unused_resource_config_paths(self):
-        self.default_project_data.update({
-            'models': model_config['my_package_name'],
-            'seeds': {},
-        })
-        project = self.from_parts()
-
-        resource_fqns = {'models': model_fqns}
-        unused = project.get_unused_resource_config_paths(resource_fqns, [])
-        self.assertEqual(len(unused), 3)
-
-    def test__get_unused_resource_config_paths_empty(self):
-        project = self.from_parts()
-        unused = project.get_unused_resource_config_paths({'models': frozenset((
-            ('my_test_project', 'foo', 'bar'),
-            ('my_test_project', 'foo', 'baz'),
-        ))}, [])
-        self.assertEqual(len(unused), 0)
 
     def test__warn_for_unused_resource_config_paths_empty(self):
         project = self.from_parts()
@@ -1172,26 +1155,17 @@ class TestRuntimeConfigWithConfigs(BaseConfigTest):
         else:
             return err
 
-    def test__get_unused_resource_config_paths(self):
-        project = self.from_parts()
-        unused = project.get_unused_resource_config_paths(self.used, [])
-        self.assertEqual(len(unused), 1)
-        self.assertEqual(unused[0], ('models', 'my_test_project', 'baz'))
 
-    @mock.patch.object(dbt.config.runtime, 'warn_or_error')
-    def test__warn_for_unused_resource_config_paths(self, warn_or_error):
+    def test__warn_for_unused_resource_config_paths(self):
         project = self.from_parts()
-        project.warn_for_unused_resource_config_paths(self.used, [])
-        warn_or_error.assert_called_once()
-
-    def test__warn_for_unused_resource_config_paths_disabled(self):
-        project = self.from_parts()
-        unused = project.get_unused_resource_config_paths(
-            self.used,
-            frozenset([('my_test_project', 'baz')])
-        )
-
-        self.assertEqual(len(unused), 0)
+        with mock.patch('dbt.config.runtime.warn_or_error') as warn_or_error_patch:
+            project.warn_for_unused_resource_config_paths(self.used, [])
+            warn_or_error_patch.assert_called_once()
+            event = warn_or_error_patch.call_args[0][0]
+            assert type(event).__name__ == 'UnusedResourceConfigPath'
+            msg = event.message()
+            expected_msg = "- models.my_test_project.baz"
+            assert expected_msg in msg
 
 
 class TestRuntimeConfigFiles(BaseFileTest):
@@ -1215,7 +1189,7 @@ class TestRuntimeConfigFiles(BaseFileTest):
         self.assertEqual(config.seed_paths, ['seeds'])
         self.assertEqual(config.test_paths, ['tests'])
         self.assertEqual(config.analysis_paths, ['analyses'])
-        self.assertEqual(config.docs_paths, ['models', 'seeds', 'snapshots', 'analyses', 'macros'])
+        self.assertEqual(set(config.docs_paths), set(['models', 'seeds', 'snapshots', 'analyses', 'macros']))
         self.assertEqual(config.asset_paths, [])
         self.assertEqual(config.target_path, 'target')
         self.assertEqual(config.clean_targets, ['target'])
@@ -1266,8 +1240,10 @@ class TestVariableRuntimeConfigFiles(BaseFileTest):
 
     def test_cli_and_env_vars(self):
         self.args.target = 'cli-and-env-vars'
-        self.args.vars = '{"cli_value_host": "cli-postgres-host", "cli_version": "0.1.2"}'
-        with mock.patch.dict(os.environ, self.env_override), temp_cd(self.project_dir):
+        self.args.vars = {"cli_value_host": "cli-postgres-host", "cli_version": "0.1.2"}
+        self.args.project_dir = self.project_dir
+        set_from_args(self.args, None)
+        with mock.patch.dict(os.environ, self.env_override):
             config = dbt.config.RuntimeConfig.from_args(self.args)
 
         self.assertEqual(config.version, "0.1.2")
