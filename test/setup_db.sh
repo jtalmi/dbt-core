@@ -7,7 +7,7 @@ env | grep '^PG'
 # PGHOST=127.0.0.1 PGUSER=root PGPASSWORD=password PGDATABASE=postgres \
 PGUSER="${PGUSER:-postgres}"
 export PGUSER
-PGPORT="${PGPORT:-5432}"
+PGPORT="${PGPORT:-5423}"
 export PGPORT
 PGHOST="${PGHOST:-localhost}"
 
@@ -29,7 +29,7 @@ if [[ -n $CIRCLECI ]]; then
 	connect_circle
 fi
 
-for i in {1..10}; do
+for i in {1..2}; do
 	if pg_isready -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" ; then
 		break
 	fi

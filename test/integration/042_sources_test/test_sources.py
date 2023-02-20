@@ -54,7 +54,7 @@ class SuccessfulSourcesTest(BaseSourcesTest):
         self.run_dbt_with_vars(['seed'])
         self.maxDiff = None
         self._id = 101
-        # this is the db initial value
+        # this is the db init\ial value
         self.last_inserted_time = "2016-09-19T14:45:51+00:00"
         os.environ['DBT_ENV_CUSTOM_ENV_key'] = 'value'
 
@@ -555,3 +555,93 @@ class TestUnquotedSources(SuccessfulSourcesTest):
     def test_postgres_catalog(self):
         self.run_dbt_with_vars(['run'])
         self.run_dbt_with_vars(['docs', 'generate'])
+
+
+class TestSourceFreshness(SuccessfulSourcesTest):
+
+    def _assert_freshness_results(self, path, state):
+        self.assertTrue(os.path.exists(path))
+        with open(path) as fp:
+            data = json.load(fp)
+
+        assert set(data) == {'metadata', 'results', 'elapsed_time'}
+        assert 'generated_at' in data['metadata']
+        assert isinstance(data['elapsed_time'], float)
+        self.assertBetween(data['metadata']['generated_at'],
+                           self.freshness_start_time)
+        assert data['metadata']['dbt_schema_version'] == 'https://schemas.getdbt.com/dbt/sources/v3.json'
+        assert data['metadata']['dbt_version'] == dbt.version.__version__
+        assert data['metadata']['invocation_id'] == dbt.tracking.active_user.invocation_id
+        key = 'key'
+        if os.name == 'nt':
+            key = key.upper()
+        assert data['metadata']['env'] == {key: 'value'}
+
+        last_inserted_time = self.last_inserted_time
+
+        self.assertEqual(len(data['results']), 1)
+
+        self.assertEqual(data['results'], [
+            {
+                'unique_id': 'source.test.test_source.test_table',
+                'max_loaded_at': last_inserted_time,
+                'snapshotted_at': AnyStringWith(),
+                'max_loaded_at_time_ago_in_s': AnyFloat(),
+                'status': state,
+                'criteria': {
+                    'filter': None,
+                    'warn_after': {'count': 10, 'period': 'hour'},
+                    'error_after': {'count': 18, 'period': 'hour'},
+                },
+                'adapter_response': {},
+                'thread_id': AnyStringWith('Thread-'),
+                'execution_time': AnyFloat(),
+                'timing': [
+                    {
+                        'name': 'compile',
+                        'started_at': AnyStringWith(),
+                        'completed_at': AnyStringWith(),
+                    },
+                    {
+                        'name': 'execute',
+                        'started_at': AnyStringWith(),
+                        'completed_at': AnyStringWith(),
+                    }
+                ]
+            }
+        ])
+
+    def _run_source_freshness(self):
+        # test_source.test_table should have a loaded_at field of `updated_at`
+        # and a freshness of warn_after: 10 hours, error_after: 18 hours
+        # by default, our data set is way out of date!
+        self.freshness_start_time = datetime.utcnow()
+        results = self.run_dbt_with_vars(
+            ['source', 'freshness', '-o', 'target/error_source.json'],
+            expect_pass=False
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, 'error')
+        self._assert_freshness_results('target/error_source.json', 'error')
+
+        self._set_updated_at_to(timedelta(hours=-12))
+        self.freshness_start_time = datetime.utcnow()
+        results = self.run_dbt_with_vars(
+            ['source', 'freshness', '-o', 'target/warn_source.json'],
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, 'warn')
+        self._assert_freshness_results('target/warn_source.json', 'warn')
+
+        self._set_updated_at_to(timedelta(hours=-2))
+        self.freshness_start_time = datetime.utcnow()
+        results = self.run_dbt_with_vars(
+            ['source', 'freshness', '-o', 'target/pass_source.json'],
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, 'pass')
+        self._assert_freshness_results('target/pass_source.json', 'pass')
+
+    @use_profile('postgres')
+    def test_postgres_source_freshness(self):
+        self._run_source_freshness()
